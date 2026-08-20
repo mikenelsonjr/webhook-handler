@@ -32,7 +32,9 @@ done < <(git diff --cached --name-only --diff-filter=ACM)
 added="$(git diff --cached --unified=0 --diff-filter=ACM | grep '^+' | grep -v '^+++' || true)"
 
 if [ -n "$added" ]; then
-  scan() { echo "$added" | grep -nEi "$1" >/dev/null 2>&1 && note "$2"; }
+  # -e is REQUIRED: several patterns begin with "-" (e.g. the -----BEGIN
+  # PRIVATE KEY----- block), which grep would otherwise parse as options.
+  scan() { echo "$added" | grep -qEi -e "$1" && note "$2"; }
 
   scan '-----BEGIN [A-Z ]*PRIVATE KEY-----'      "private key block"
   scan '"type"[[:space:]]*:[[:space:]]*"service_account"' "GCP service-account JSON"
@@ -43,15 +45,20 @@ if [ -n "$added" ]; then
   scan '\bsk-[0-9A-Za-z]{32,}'                   "OpenAI-style API key"
   scan '\bsk-ant-[0-9A-Za-z_-]{20,}'             "Anthropic API key"
 
-  # Generic assignment of a long literal to a secret-ish name. Three classes of
-  # false positive are filtered out, in order:
+  # Generic assignment of a long literal to a secret-ish name. Filtered out:
   #   1. documented placeholders (.env.example, docs)
-  #   2. env-var indirection (the code reads a secret, it does not contain one)
+  #   2. env-var indirection — the code READS a secret, it does not contain one
   #   3. REFERENCES to a secret store: --set-secrets NAME=secret-name:latest,
   #      k8s secretKeyRef, GitHub Actions secrets.X. A secret's *name* is not
   #      its value, and deploy docs are full of them.
+  #   4. prose that merely NAMES the pattern. The right-hand side must look like
+  #      a real credential token — a run of 12+ token characters — not the next
+  #      word of a sentence. Without this, docs ABOUT secret scanning trip the
+  #      secret scanner (e.g. a list of `password =`, `api_key =` patterns).
+  # Escape hatch: append   # pragma: allow-secret   to a line to skip it.
   echo "$added" \
-    | grep -Ei '(api[_-]?key|secret|password|passwd|token|private[_-]?key)[[:space:]]*[:=][[:space:]]*.{12,}' \
+    | grep -Evi 'pragma:[[:space:]]*allow-secret' \
+    | grep -Ei '(api[_-]?key|secret|password|passwd|token|private[_-]?key)[[:space:]]*[:=][[:space:]]*[^[:alnum:]]{0,2}[A-Za-z0-9_+/=.-]{12,}' \
     | grep -Evi '(example|placeholder|changeme|your[_-]|xxx+|\*\*\*|<[a-z_]+>|\$\{?[A-Z_]+\}?)' \
     | grep -Evi '(os\.environ|getenv|process\.env|secret(manager|client))' \
     | grep -Evi '(--set-secrets|secretkeyref|value_?from|secrets\.[a-z_]|\$\{\{|:latest([[:space:]]|$)|:[0-9]+$)' \
