@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+#
+# pre-commit — block likely secrets from reaching a PUBLIC repo.
+#
+# A credential pushed to a public repo is compromised the moment it lands:
+# GitHub's event firehose is scraped continuously, and forks plus the commit
+# cache survive a force-push. Rotate first, scrub second — never the reverse.
+#
+# Enabled via `git config core.hooksPath .githooks` (see README).
+# Bypass with `git commit --no-verify` only when you are certain a hit is a
+# false positive, and say so in the commit message.
+
+set -uo pipefail
+
+fail=0
+note() { echo "  ✖ $1" >&2; fail=1; }
+
+# --- 1. Whole files that should never be committed ---------------------------
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  case "$(basename "$f")" in
+    .env|.env.*)
+      [ "$(basename "$f")" = ".env.example" ] && continue
+      note "staged env file: $f" ;;
+    *credentials*.json|service-account*.json|*-key.json|id_rsa|id_ed25519)
+      note "staged credential file: $f" ;;
+  esac
+done < <(git diff --cached --name-only --diff-filter=ACM)
+
+# --- 2. Secret-shaped content in the staged diff -----------------------------
+# Only added lines (^+) are scanned, so pre-existing text never re-triggers.
+added="$(git diff --cached --unified=0 --diff-filter=ACM | grep '^+' | grep -v '^+++' || true)"
+
+if [ -n "$added" ]; then
+  scan() { echo "$added" | grep -nEi "$1" >/dev/null 2>&1 && note "$2"; }
+
+  scan '-----BEGIN [A-Z ]*PRIVATE KEY-----'      "private key block"
+  scan '"type"[[:space:]]*:[[:space:]]*"service_account"' "GCP service-account JSON"
+  scan '\bAKIA[0-9A-Z]{16}\b'                    "AWS access key id"
+  scan '\bAIza[0-9A-Za-z_-]{35}\b'               "Google API key"
+  scan '\bgh[pousr]_[0-9A-Za-z]{36,}'            "GitHub token"
+  scan '\bxox[abprs]-[0-9A-Za-z-]{10,}'          "Slack token"
+  scan '\bsk-[0-9A-Za-z]{32,}'                   "OpenAI-style API key"
+  scan '\bsk-ant-[0-9A-Za-z_-]{20,}'             "Anthropic API key"
+
+  # Generic assignment of a long literal to a secret-ish name. Three classes of
+  # false positive are filtered out, in order:
+  #   1. documented placeholders (.env.example, docs)
+  #   2. env-var indirection (the code reads a secret, it does not contain one)
+  #   3. REFERENCES to a secret store: --set-secrets NAME=secret-name:latest,
+  #      k8s secretKeyRef, GitHub Actions secrets.X. A secret's *name* is not
+  #      its value, and deploy docs are full of them.
+  echo "$added" \
+    | grep -Ei '(api[_-]?key|secret|password|passwd|token|private[_-]?key)[[:space:]]*[:=][[:space:]]*.{12,}' \
+    | grep -Evi '(example|placeholder|changeme|your[_-]|xxx+|\*\*\*|<[a-z_]+>|\$\{?[A-Z_]+\}?)' \
+    | grep -Evi '(os\.environ|getenv|process\.env|secret(manager|client))' \
+    | grep -Evi '(--set-secrets|secretkeyref|value_?from|secrets\.[a-z_]|\$\{\{|:latest([[:space:]]|$)|:[0-9]+$)' \
+    | grep -Evi '_key[[:space:]]*[:=][[:space:]]*"[a-z_]+"' \
+    | grep -q . && note "hardcoded credential assignment"
+fi
+
+if [ "$fail" -ne 0 ]; then
+  cat >&2 <<'MSG'
+
+COMMIT BLOCKED — this repo is public.
+
+Move the value into an environment variable or Secret Manager, document the
+name in .env.example, and re-stage. If the value is genuinely not a secret,
+re-run with:  git commit --no-verify
+
+MSG
+  exit 1
+fi
+
+exit 0

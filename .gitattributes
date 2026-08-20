@@ -1,0 +1,13 @@
+# Normalize every text file to LF in the repository AND on checkout.
+# Without this, core.autocrlf=true on Windows checks .githooks/pre-commit out
+# with CRLF, and bash on Linux/macOS fails with: $'\r': command not found.
+* text=auto eol=lf
+
+# Binaries must never be touched.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.zip  binary

@@ -1,0 +1,1 @@
+This is a webhook handler repo built as an accelerator for future work. It will be a python ingest service running on cloud run that pushes the data to a message queue pub/sub
