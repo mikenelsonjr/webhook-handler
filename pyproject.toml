@@ -28,7 +28,10 @@ gcp = [
 ]
 dev = [
     "pytest~=8.3",
-    "httpx~=0.28",
+    # Starlette's TestClient deprecated httpx in favour of httpx2; the old one
+    # still works but warns, and a template should not ship a deprecation for
+    # every consumer to inherit.
+    "httpx2~=2.12",
     "ruff~=0.8",
 ]
 

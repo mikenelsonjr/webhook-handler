@@ -7,7 +7,7 @@ import pytest
 ENV = {
     "GCP_PROJECT": "proj-from-env",
     "PUBSUB_TOPIC": "topic-from-env",
-    "WEBHOOK_SIGNING_SECRET": "secret-from-env-value",  # pragma: allow-secret
+    "WEBHOOK_SIGNING_SECRET": "secret-from-env-value", 
 }
 
 

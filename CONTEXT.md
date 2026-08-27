@@ -55,6 +55,46 @@ the first thing a consumer should replace. An unset secret fails closed.
 `Access-Control-Allow-Origin: *` and answered OPTIONS preflights, which is
 meaningless here and invites browser-driven abuse.
 
+**Configuration is read from `os.environ` in exactly one place.**
+`Settings.from_env(env)` is a pure function of a mapping — no `os.environ`, no
+`.env` loading, no import-time I/O. Only the entrypoint reads the ambient
+environment, at module scope:
+
+```python
+settings = Settings.from_env(os.environ)     # main.py, module scope
+```
+
+| Environment | Config source | Who reads it |
+|---|---|---|
+| Local | `.env` via `uvicorn --env-file .env` | uvicorn, before import |
+| CI / tests | an explicit dict | the test, never the process env |
+| Cloud Run | `--set-env-vars` + `--set-secrets` | the platform |
+
+`.env` is a local-development convenience, never a configuration mechanism.
+Loading it inside `config.py` would mean importing the module reads whatever
+file happens to be on the developer's machine, so tests pass locally and fail
+in CI for reasons unrelated to the code. `uvicorn[standard]` already depends on
+`python-dotenv` and exposes `--env-file`, so local `.env` support costs no code
+and has no production surface. **Do not import `dotenv` in the service.**
+
+Rejected `pydantic-settings`: nearly free given FastAPI already brings pydantic,
+but it reads `os.environ` and `.env` from inside the settings class, which
+reintroduces the import-time coupling this design removes.
+
+**Configuration failures crash the container, not the request.** `from_env`
+validates and raises, and the entrypoint calls it at import. A missing variable
+fails the revision at startup, Cloud Run keeps the previous revision serving,
+and no traffic is routed to the broken one. Discovering it on the first webhook
+instead means 503-ing a real event that may never be retried.
+
+**Secrets arrive as environment variables, not SDK calls.** Cloud Run's
+`--set-secrets` mounts a Secret Manager version into the environment, so the
+service needs no GCP client, no IAM at request time, and gains no failure mode
+on the hot path. Tradeoff: `:latest` resolves at *instance start*, so a rotated
+secret takes effect as instances recycle rather than immediately. Fetching from
+Secret Manager at runtime would close that gap and is not worth the complexity
+here.
+
 ## Repo layout
 
 Four components, one repo, because they are one deployable system: the topic
