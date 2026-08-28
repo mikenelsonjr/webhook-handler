@@ -30,3 +30,20 @@ htmlcov/
 Thumbs.db
 .idea/
 *.swp
+
+# --- Terraform ----------------------------------------------------------------
+# State holds every attribute of every managed resource in PLAINTEXT, including
+# anything a provider marks sensitive. It is the single most dangerous file in
+# a Terraform repo and this one is public.
+*.tfstate
+*.tfstate.*
+.terraform/
+crash.log
+crash.*.log
+
+# Real variable values. Only terraform.tfvars.example is tracked.
+terraform.tfvars
+*.auto.tfvars
+
+# .terraform.lock.hcl is NOT ignored: it pins provider checksums, so committing
+# it is what makes `init` reproducible for everyone who clones this.

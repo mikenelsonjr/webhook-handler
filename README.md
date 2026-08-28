@@ -154,6 +154,35 @@ an injected fake client and still need no credentials:
 pip install -e ".[dev,gcp]"
 ```
 
+### Infrastructure checks
+
+`infra/` holds the Terraform. Its checks are a **separate CI job** and are not
+driven from `pytest`: folding them in would mean the Python suite needs a
+Terraform toolchain on PATH to run at all.
+
+You do not need Terraform installed — Docker is enough, and nothing below
+touches GCP or needs credentials:
+
+```bash
+tf()     { docker run --rm -v "$PWD/infra:/w" -w /w hashicorp/terraform:latest "$@"; }
+tflint() { docker run --rm -v "$PWD/infra:/data" -v tflint-plugins:/root/.tflint.d \
+             ghcr.io/terraform-linters/tflint:latest "$@"; }
+
+tf fmt -check -diff
+tf init -backend=false     # no state, no backend, no credentials
+tf validate
+tflint --init && tflint --format compact
+```
+
+`tflint --init` installs the Google ruleset into the named volume, so it is
+downloaded once rather than on every run. That ruleset is what catches values
+the provider schema accepts and the API later rejects — `validate` cannot see
+those, because it only checks shape.
+
+Copy `infra/terraform.tfvars.example` to `terraform.tfvars` and fill it in.
+`project_id` and `region` deliberately have **no defaults**: a default there
+silently deploys to the wrong project.
+
 ### Running the whole thing
 
 `docker compose` brings **both services** up against a **Pub/Sub emulator** — no

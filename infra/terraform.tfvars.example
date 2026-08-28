@@ -1,0 +1,8 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored.
+#
+# Same convention as .env.example: every variable documented BY NAME, with no
+# real value. This repo is public, and a project id is not secret but a habit
+# of committing real values is.
+
+project_id = "" # e.g. "my-project-1234" — the id, not the number
+region     = "" # e.g. "us-central1"

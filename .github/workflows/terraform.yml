@@ -1,0 +1,65 @@
+# Terraform checks, deliberately in their own workflow.
+#
+# Folding these into the Python job would mean `pytest` needs a Terraform
+# toolchain on PATH to run at all — on every contributor's machine, for a suite
+# that otherwise needs nothing but Python. See CONTEXT.md.
+#
+# Nothing here touches GCP. `init -backend=false` skips state entirely and
+# `validate` needs no credentials, so this runs on every PR from a fork.
+
+name: Terraform
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege: this workflow only reads the checkout.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: infra
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          # Matches required_version in versions.tf. Pinned rather than
+          # "latest" so a Terraform release cannot fail CI on a branch nobody
+          # touched.
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+
+      - name: Format
+        run: terraform fmt -check -recursive -diff
+
+      - name: Init
+        # No backend: state is the consumer's decision, and CI has no business
+        # reading it.
+        run: terraform init -backend=false -input=false
+
+      - name: Validate
+        run: terraform validate
+
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: v0.53.0
+
+      - name: Cache tflint plugins
+        uses: actions/cache@v4
+        with:
+          path: ~/.tflint.d/plugins
+          key: tflint-${{ hashFiles('infra/.tflint.hcl') }}
+
+      - name: Lint
+        # --init installs the Google ruleset declared in .tflint.hcl, which is
+        # what catches values the schema accepts and the API rejects.
+        run: |
+          tflint --init
+          tflint --format compact
