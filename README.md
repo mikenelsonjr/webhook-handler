@@ -2,21 +2,48 @@
 
 [![CI](https://github.com/mikenelsonjr/webhook-handler/actions/workflows/ci.yml/badge.svg)](https://github.com/mikenelsonjr/webhook-handler/actions/workflows/ci.yml)
 
-A Python webhook ingest service for Cloud Run that validates inbound requests
-and publishes them to a Pub/Sub topic.
+A Python webhook ingest service for Cloud Run that authenticates inbound
+deliveries and publishes them to a Pub/Sub topic.
 
 The pattern it implements: **accept fast, process later.** The handler does the
-minimum synchronous work — verify the signature, shape the payload, publish —
-and returns. Everything expensive happens downstream in a subscriber, so a slow
-consumer can never cause the sender to time out and retry.
+minimum synchronous work — authenticate, publish, acknowledge — and returns.
+Everything expensive happens downstream in a subscriber, so a slow consumer can
+never make the sender time out.
+
+One rule drives the design: **a 2xx is a promise.** Senders treat it as "you
+own this now." So the service acknowledges only after the publish is confirmed
+durable, and returns 503 otherwise. Returning 200 first turns every transient
+Pub/Sub error into permanent, silent data loss.
 
 Part of the [Accelerators](https://github.com/mikenelsonjr/Accelerators)
 catalog.
 
-> **Status: greenfield.** The design and the decisions behind it are settled and
-> written up in [CONTEXT.md](CONTEXT.md); the implementation is not written yet.
-> The repo scaffolding — CI, secret guards, license — is in place so the first
-> commit of real code lands in a repo that is already correct.
+## Built for Aptly first, designed to be extended
+
+This was built against a real provider — [Aptly](https://getaptly.com) card
+webhooks — rather than an imagined one, because a template validated only
+against its own assumptions tends to be wrong in ways nobody notices until
+production. Everything here has been driven end to end against a running
+service and a Pub/Sub emulator.
+
+That means a few defaults reflect Aptly's actual behaviour, and those are
+exactly the places to look first when adapting it:
+
+| Aptly does this | Your provider may not | Where to change it |
+|---|---|---|
+| Sends a static token in `x-signingkey` | Most sign the body (HMAC) | `ingest/security.py` |
+| Sends no delivery-id header | Many send one (`X-GitHub-Delivery`) | `event_id` in `ingest/app.py` |
+| Never retries a failed delivery | Most retry on 5xx | `ingest/retry.py` |
+
+None of that is baked into the structure. Authentication is one function behind
+one call site; the publisher is a `Protocol` with a swappable implementation;
+retry is a wrapper you can delete in one line. The parts that generalise — the
+delivery guarantee, the rejection ordering, request hygiene, structured logging
+without payload leakage — are provider-agnostic.
+
+**[CONTEXT.md](CONTEXT.md) explains why each decision was made**, including the
+security tradeoff of a shared secret versus HMAC and what compensates for it.
+Read it before changing anything load-bearing.
 
 ## Use this template
 
@@ -31,17 +58,39 @@ cp .env.example .env                  # then fill it in
 
 ## What to change first
 
-1. **`PUBSUB_TOPIC` and `GCP_PROJECT`** in `.env` — point at your project and
-   topic. The topic must exist before the service starts.
-2. **Signature verification** — every provider signs differently (Stripe's
-   `Stripe-Signature`, GitHub's `X-Hub-Signature-256`, a plain shared secret).
-   Replace the verification step with your provider's scheme; do not ship the
-   placeholder.
-3. **The payload contract** — decide what goes on the wire to Pub/Sub. Publish
-   a stable envelope you control, not the provider's raw body, so a change on
-   their side doesn't break every subscriber.
-4. **`WEBHOOK_SIGNING_SECRET`** — source it from Secret Manager in every
-   deployed environment. Never a literal, never in this repo.
+1. **`GCP_PROJECT` and `PUBSUB_TOPIC`** — point at your project and topic. Both
+   the topic *and* a subscription must exist before the first publish: Pub/Sub
+   only retains messages for subscriptions that already existed, so creating
+   one later silently loses everything sent so far.
+
+2. **`WEBHOOK_SIGNING_SECRET`** — from Secret Manager in every deployed
+   environment (`--set-secrets`). Never a literal, never in this repo. An unset
+   value fails closed, so the service refuses everything rather than accepting
+   everything.
+
+3. **Authentication, if your provider signs the body.** `ingest/security.py`
+   holds one function, `verify_signing_key(expected, provided)`, called from
+   one place. For an HMAC provider, replace it with a comparison over the raw
+   request body — which the route already has in hand precisely so this swap
+   stays a one-file change. Keep `hmac.compare_digest`.
+
+4. **`event_id`, if your provider sends a delivery id.** It is currently a
+   SHA-256 of the raw body, because Aptly sends no such header. A
+   provider-supplied id is strictly better — it stays stable across the
+   *sender's* retries, and it cannot collide when two genuinely distinct events
+   carry identical payloads.
+
+5. **Retry, if your provider does retry.** `RetryingPublisher` exists because
+   Aptly delivers once and ignores the response, so a 503 earns no
+   redelivery. If yours retries on 5xx, the sender is a better safety net than
+   in-process backoff — drop the wrapper from `main.py`.
+
+**What not to change:** the raw request body is published byte-for-byte,
+deliberately. Re-serializing through `json.dumps` reorders keys and drops
+whitespace, so a consumer can no longer verify or compare against what the
+provider actually sent. If you want a stable envelope for subscribers, build it
+in the processor where you control both sides — not by rewriting bytes in
+flight.
 
 ## Local development
 
@@ -111,9 +160,15 @@ gcloud run deploy webhook-handler \
 ```
 
 Give the service's identity `roles/pubsub.publisher` on the topic and nothing
-more. Do not deploy with `--allow-unauthenticated` until signature verification
-is implemented and tested — an open, unverified ingest endpoint is a free way
-for anyone to inject messages into your queue.
+more.
+
+`--allow-unauthenticated` is required for a provider that cannot present a
+Google identity, which is the usual case — the signing key is then the only
+thing standing between the internet and your topic. Confirm it is set and
+working before the endpoint is reachable: an unset secret fails closed, so the
+failure mode is a service that rejects everything rather than one that accepts
+everything, but verify rather than assume. Restrict ingress to the provider's
+IP ranges if they publish them.
 
 ## Security
 
