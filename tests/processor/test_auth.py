@@ -147,9 +147,14 @@ def test_selecting_none_warns_at_startup():
     it is allowed — but an accidental production deploy has to be visible."""
     from processor.app import create_app
     from processor.config import Settings
+    from processor.dedup import InMemorySeenStore
 
     with capture_processor_output() as stream:
-        create_app(settings=Settings.from_env({"PUSH_AUTH_MODE": "none"}), handler=FakeHandler())
+        create_app(
+            settings=Settings.from_env({"PUSH_AUTH_MODE": "none"}),
+            handler=FakeHandler(),
+            seen=InMemorySeenStore(),
+        )
 
     warnings = [line for line in emitted(stream) if line["severity"] == "WARNING"]
     assert warnings, "PUSH_AUTH_MODE=none must warn at startup"
@@ -162,9 +167,14 @@ def test_the_authenticated_modes_do_not_warn(mode):
     matters."""
     from processor.app import create_app
     from processor.config import Settings
+    from processor.dedup import InMemorySeenStore
 
     with capture_processor_output() as stream:
-        create_app(settings=Settings.from_env(env(PUSH_AUTH_MODE=mode)), handler=FakeHandler())
+        create_app(
+            settings=Settings.from_env(env(PUSH_AUTH_MODE=mode)),
+            handler=FakeHandler(),
+            seen=InMemorySeenStore(),
+        )
 
     assert not [line for line in emitted(stream) if line["severity"] == "WARNING"]
 

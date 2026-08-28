@@ -30,6 +30,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from processor.dedup import DEFAULT_MAX_ENTRIES, DEFAULT_TTL_SECONDS
+
 #: The platform authenticated the caller before the request arrived. Cloud Run
 #: with ``--no-allow-unauthenticated`` and ``roles/run.invoker`` on the push
 #: service account — the intended production posture.
@@ -59,6 +61,8 @@ class Settings:
     push_auth_mode: str
     push_service_account: str | None = None
     push_audience: str | None = None
+    dedup_ttl_seconds: int = DEFAULT_TTL_SECONDS
+    dedup_max_entries: int = DEFAULT_MAX_ENTRIES
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> Settings:
@@ -78,11 +82,37 @@ class Settings:
                 raise ValueError(f"{key} is required when PUSH_AUTH_MODE={OIDC}")
             return value
 
+        def positive_int(key: str, default: int) -> int:
+            # Absent means "use the default". Present-but-empty does not: that
+            # is a broken deploy (`--set-env-vars DEDUP_TTL_SECONDS=`), and
+            # quietly substituting a default would hide it.
+            if key not in env:
+                return default
+            raw = env.get(key, "").strip()
+            if not raw:
+                raise ValueError(f"{key} is set but empty; unset it to use the default")
+            try:
+                value = int(raw)
+            except ValueError as exc:
+                raise ValueError(f"{key} must be a whole number; got {raw!r}") from exc
+            if value < 1:
+                # Zero or negative would mean "expire immediately" or "hold
+                # nothing", which is dedup that silently does not dedup. If
+                # that is what you want, pass a store that always claims.
+                raise ValueError(f"{key} must be at least 1; got {value}")
+            return value
+
+        bounds = {
+            "dedup_ttl_seconds": positive_int("DEDUP_TTL_SECONDS", DEFAULT_TTL_SECONDS),
+            "dedup_max_entries": positive_int("DEDUP_MAX_ENTRIES", DEFAULT_MAX_ENTRIES),
+        }
+
         if mode != OIDC:
-            return cls(push_auth_mode=mode)
+            return cls(push_auth_mode=mode, **bounds)
 
         return cls(
             push_auth_mode=mode,
             push_service_account=require("PUSH_SERVICE_ACCOUNT"),
             push_audience=require("PUSH_AUDIENCE"),
+            **bounds,
         )

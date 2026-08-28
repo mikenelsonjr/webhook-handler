@@ -43,6 +43,7 @@ import logging
 from fastapi import FastAPI, Request, Response
 
 from processor.config import NONE, OIDC, Settings
+from processor.dedup import SeenStore
 from processor.envelope import EnvelopeError, parse_push_envelope
 from processor.handler import Handler, PermanentError, RetryableError
 from processor.security import verify_push_token
@@ -57,20 +58,21 @@ UNAUTHORIZED = 401
 def create_app(
     settings: Settings,
     handler: Handler,
-    seen=None,
+    seen: SeenStore,
     *,
     verify=verify_push_token,
 ) -> FastAPI:
     """Build the processor application.
 
-    ``seen`` is the idempotency store and is accepted but unused until #13.
-    Delivery is at-least-once — from Pub/Sub redelivery and from ingest
-    retrying a publish that timed out after the message was already stored — so
-    until that story lands, a duplicate is dispatched to the handler twice and
-    the handler must be idempotent on its own.
+    ``seen`` is required rather than optional. Delivery is at-least-once — from
+    Pub/Sub redelivery and from ingest retrying a publish that timed out after
+    the message was already stored — so an app running with no idempotency at
+    all should be a decision someone made, not a default they inherited. Pass a
+    store that always claims to opt out.
 
-    ``verify`` is injected so the authenticated path is testable with no
-    network and no credentials.
+    ``verify`` and ``seen`` are both injected so the whole path is testable with
+    no network and no credentials, and so the in-memory store can be swapped
+    for Firestore or Redis without touching this file.
     """
     # Docs are disabled: the only caller is Pub/Sub, and an interactive schema
     # browser is attack surface with no audience.
@@ -142,13 +144,34 @@ def create_app(
             )
             return Response(status_code=ACK)
 
-        # 2. Dispatch. The handler classifies its own failures, because the
+        # 2. Claim, before handling. Claiming after would mean a crash between
+        #    the two leaves the event unclaimed and it runs twice; claiming
+        #    before means a crash leaves the claim standing and it never runs.
+        #    Neither is free, and this one errs toward a duplicate rather than
+        #    a loss — the same trade the rest of the service makes.
+        if not seen.claim(event.event_id):
+            # Already handled. Ack: whatever produced the duplicate — a
+            # redelivery, or ingest retrying a publish that had actually
+            # succeeded — is satisfied by the same answer the first one got.
+            logger.info("duplicate event, acking without handling", extra=_context(event))
+            return Response(status_code=ACK)
+
+        # 3. Dispatch. The handler classifies its own failures, because the
         #    endpoint cannot tell a transient fault from a permanent one and
         #    guessing is how a service either loses events or redelivers a
         #    poison pill forever.
+        #
+        #    Every failure path releases the claim. For a nack that is not
+        #    optional: a nack asks Pub/Sub to send the event again, and a
+        #    surviving claim would make the endpoint swallow that redelivery,
+        #    so the two together would lose the event outright.
         try:
             handler.handle(event)
         except PermanentError as exc:
+            # Released even though this acks. The event was abandoned, not
+            # completed, so a genuine duplicate arriving later should be
+            # abandoned again visibly rather than skipped in silence.
+            seen.release(event.event_id)
             logger.error(
                 "permanent failure, acking: %s",
                 type(exc).__name__,
@@ -156,6 +179,7 @@ def create_app(
             )
             return Response(status_code=ACK)
         except RetryableError as exc:
+            seen.release(event.event_id)
             logger.warning(
                 "retryable failure, nacking: %s",
                 type(exc).__name__,
@@ -163,6 +187,7 @@ def create_app(
             )
             return Response(status_code=NACK)
         except Exception as exc:
+            seen.release(event.event_id)
             # Deliberately broad, and deliberately a nack. An unrecognised
             # failure might be transient, and Pub/Sub's bounded retry plus the
             # dead-letter topic means it gets investigated rather than lost.
