@@ -177,12 +177,14 @@ def make_app_client(mode: str, *, handler=None, verify=None):
 
     from processor.app import create_app
     from processor.config import Settings
+    from processor.dedup import InMemorySeenStore
 
     kwargs = {} if verify is None else {"verify": verify}
     return TestClient(
         create_app(
             settings=Settings.from_env(env(PUSH_AUTH_MODE=mode)),
             handler=handler or FakeHandler(),
+            seen=InMemorySeenStore(),
             **kwargs,
         ),
         raise_server_exceptions=False,

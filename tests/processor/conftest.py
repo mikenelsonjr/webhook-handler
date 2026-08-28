@@ -46,8 +46,14 @@ Build these and the tests have something to bind to::
             decode=..., now=time.time,
         ) -> bool
 
+    processor/dedup.py
+        class SeenStore(Protocol):
+            def claim(self, event_id: str) -> bool: ...   # False if already claimed
+            def release(self, event_id: str) -> None: ...
+        class InMemorySeenStore: ...   # bounded, TTL, per-instance only
+
     processor/app.py
-        def create_app(settings, handler, seen=None, *, verify=...) -> FastAPI
+        def create_app(settings, handler, seen, *, verify=...) -> FastAPI
 
 Routes: ``GET /healthz`` (unauthenticated) and ``POST /_pubsub/push``.
 
@@ -218,8 +224,20 @@ def handler():
 
 
 @pytest.fixture
-def make_client(settings):
-    """Build a TestClient over an app wired to a given handler."""
+def seen():
+    """A fresh idempotency store per test, so no claim leaks between them."""
+    from processor.dedup import InMemorySeenStore
+
+    return InMemorySeenStore()
+
+
+@pytest.fixture
+def make_client(settings, seen):
+    """Build a TestClient over an app wired to a given handler.
+
+    The same `seen` store the fixture hands the test, so a test can inspect
+    what the endpoint claimed and released.
+    """
     from fastapi.testclient import TestClient
 
     from processor.app import create_app
@@ -229,7 +247,7 @@ def make_client(settings):
 
         cfg = dataclasses.replace(settings, **setting_overrides) if setting_overrides else settings
         return TestClient(
-            create_app(settings=cfg, handler=hand or FakeHandler()),
+            create_app(settings=cfg, handler=hand or FakeHandler(), seen=seen),
             # So an unhandled exception surfaces as the response the endpoint
             # would really return, rather than being re-raised into the test.
             raise_server_exceptions=False,
