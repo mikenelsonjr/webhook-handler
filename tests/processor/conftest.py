@@ -30,8 +30,24 @@ Build these and the tests have something to bind to::
             def handle(self, event: Event) -> None: ...
         class LoggingHandler: ...              # the runnable default stub
 
+    processor/config.py
+        @dataclass(frozen=True)
+        class Settings:
+            push_auth_mode: str            # "iam" | "none" | "oidc", no default
+            push_service_account: str | None = None   # required when oidc
+            push_audience: str | None = None          # required when oidc
+
+            @classmethod
+            def from_env(cls, env: Mapping[str, str]) -> "Settings": ...
+
+    processor/security.py
+        def verify_push_token(
+            authorization: str | None, *, audience: str, service_account: str,
+            decode=..., now=time.time,
+        ) -> bool
+
     processor/app.py
-        def create_app(settings, handler, seen=None) -> FastAPI
+        def create_app(settings, handler, seen=None, *, verify=...) -> FastAPI
 
 Routes: ``GET /healthz`` (unauthenticated) and ``POST /_pubsub/push``.
 
@@ -190,7 +206,10 @@ class FakeHandler:
 def settings():
     from processor.config import Settings
 
-    return Settings()
+    # `none`: these tests are about the endpoint's delivery behaviour, not its
+    # authentication, and `none` is the mode that performs no verification.
+    # tests/processor/test_auth.py builds its own settings per mode.
+    return Settings.from_env({"PUSH_AUTH_MODE": "none"})
 
 
 @pytest.fixture
