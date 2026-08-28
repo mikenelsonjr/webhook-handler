@@ -45,18 +45,60 @@ cp .env.example .env                  # then fill it in
 
 ## Local development
 
-Requires Python 3.12+ and the `gcloud` CLI.
+### Tests
 
 ```bash
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
-cp .env.example .env
 
 python -m pytest          # tests
 ruff check .              # lint
 ```
 
-Run commands land here once the service exists — see CONTEXT.md.
+The suite never touches GCP — it drives the app through a fake publisher. Add
+the `[gcp]` extra to also run the concrete Pub/Sub publisher's tests, which use
+an injected fake client and still need no credentials:
+
+```bash
+pip install -e ".[dev,gcp]"
+```
+
+### Running the whole thing
+
+`docker compose` brings the service up against a **Pub/Sub emulator** — no GCP
+project, no credentials, and no way to write to a real topic by accident. The
+client switches to the emulator purely because `PUBSUB_EMULATOR_HOST` is set;
+nothing in the application code knows the difference.
+
+```bash
+docker compose up --build
+curl -sS localhost:8080/healthz
+```
+
+Send a delivery shaped like a real one (the key matches `docker-compose.yml`):
+
+```bash
+curl -X POST localhost:8080/webhook \
+  -H 'Content-Type: application/json' \
+  -H 'x-signingkey: local-dev-key-not-a-real-credential' \
+  -d '{"action":"update","data":{"_id":"abc"}}'
+# {"message_id":"1","event_id":"cf709a70..."}
+```
+
+Then read exactly what landed on the topic — raw bytes and attributes:
+
+```bash
+docker compose run --rm pull
+docker compose down -v          # stop and discard emulator state
+```
+
+`topic-init` creates the topic **and** the subscription before the service
+starts. Both are needed up front: Pub/Sub only retains a message for
+subscriptions that already existed when it was published, so creating the
+subscription later leaves everything sent so far silently unreadable.
+
+Without Docker, `uvicorn main:app --reload --env-file .env` works too, but you
+will need a real topic and credentials.
 
 ## Deploy
 

@@ -55,6 +55,11 @@ if [ -n "$added" ]; then
   #      a real credential token — a run of 12+ token characters — not the next
   #      word of a sentence. Without this, docs ABOUT secret scanning trip the
   #      secret scanner (e.g. a list of `password =`, `api_key =` patterns).
+  #   5. assignment from a NAME rather than a literal — the right-hand side is a
+  #      dotted attribute or a snake_case identifier, so the code points at a
+  #      credential instead of containing one. Indirection is the correct pattern
+  #      and flagging it punishes the fix. A bare literal with neither a dot nor
+  #      an underscore is still caught.
   # Escape hatch: append   # pragma: allow-secret   to a line to skip it.
   echo "$added" \
     | grep -Evi 'pragma:[[:space:]]*allow-secret' \
@@ -63,6 +68,7 @@ if [ -n "$added" ]; then
     | grep -Evi '(os\.environ|getenv|process\.env|secret(manager|client))' \
     | grep -Evi '(--set-secrets|secretkeyref|value_?from|secrets\.[a-z_]|\$\{\{|:latest([[:space:]]|$)|:[0-9]+$)' \
     | grep -Evi '_key[[:space:]]*[:=][[:space:]]*"[a-z_]+"' \
+    | grep -Evi '[:=][[:space:]]*(([a-z_][a-z0-9_]*\.)+[a-z_][a-z0-9_]*|[a-z][a-z0-9]*(_[a-z0-9]+)+)[[:space:]]*[,)]?[[:space:]]*$' \
     | grep -q . && note "hardcoded credential assignment"
 fi
 

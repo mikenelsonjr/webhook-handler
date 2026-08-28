@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "webhook-handler"
+version = "0.1.0"
+description = "Webhook ingest service: verify, then publish to Pub/Sub"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+
+# Compatible-release pins, not bare wildcards. `futures` and `Callable` are
+# deliberately absent: `concurrent.futures` and `typing.Callable` are stdlib,
+# and the PyPI packages by those names are a Python 2 backport (which shadows
+# the stdlib module) and an unrelated third-party library respectively.
+dependencies = [
+    "fastapi~=0.115",
+    "uvicorn[standard]~=0.32",
+]
+
+[project.optional-dependencies]
+# The concrete Pub/Sub publisher. Kept out of the base install so the test
+# suite — which drives the app through a fake publisher — does not need the
+# grpc toolchain. Production installs use `.[gcp]`.
+gcp = [
+    "google-cloud-pubsub~=2.23",
+]
+dev = [
+    "pytest~=8.3",
+    # Starlette's TestClient deprecated httpx in favour of httpx2; the old one
+    # still works but warns, and a template should not ship a deprecation for
+    # every consumer to inherit.
+    "httpx2~=2.12",
+    "ruff~=0.8",
+]
+
+[tool.setuptools.packages.find]
+# One distribution, two deployables: the webhook receiver and the Pub/Sub
+# subscriber. They share the message envelope, which is what `tests/contract/`
+# exists to pin down. Terraform lives in `infra/` and is not a Python package.
+include = ["ingest*", "processor*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q --strict-markers"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S"]
+# S101 = assert, expected in tests. S105/S106 = "hardcoded password": the test
+# secrets are fixtures, and a signature suite cannot be written without them.
+per-file-ignores = { "tests/*" = ["S101", "S105", "S106"] }

@@ -1,0 +1,100 @@
+# Local stack: the service plus a Pub/Sub emulator. No GCP project, no
+# credentials, no billing, no risk of writing to a real topic by accident.
+#
+#   docker compose up --build
+#   curl -sS localhost:8080/healthz
+#
+# Send a signed webhook (the key matches WEBHOOK_SIGNING_SECRET below):
+#   curl -sS -X POST localhost:8080/webhook \
+#     -H 'Content-Type: application/json' \
+#     -H 'X-SigningKey: local-dev-key-not-a-real-credential' \
+#     -d '{"action":"update","data":{"_id":"abc"}}'
+#
+# Read what landed on the topic:
+#   docker compose run --rm pull
+#
+# The client talks to the emulator purely because PUBSUB_EMULATOR_HOST is set —
+# nothing in the application code knows the difference.
+
+services:
+  pubsub:
+    image: gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators
+    command: >
+      gcloud beta emulators pubsub start
+      --project=local-project --host-port=0.0.0.0:8085
+    ports: ["8085:8085"]
+    healthcheck:
+      # The emulator answers this once it is listening.
+      test: ["CMD", "python3", "-c",
+             "import urllib.request;urllib.request.urlopen('http://localhost:8085/v1/projects/local-project/topics')"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  # The emulator starts empty, so the topic must exist before the service
+  # publishes to it. The SUBSCRIPTION must exist too, and before the first
+  # publish: Pub/Sub only retains a message for subscriptions that already
+  # existed when it was published. Create it later and everything sent so far
+  # is simply gone — which looks exactly like a broken publisher.
+  # One-shot: runs, creates both, exits.
+  topic-init:
+    image: curlimages/curl:latest
+    depends_on:
+      pubsub: {condition: service_healthy}
+    entrypoint: ["sh", "-c"]
+    # A LIST with one item, not a plain string: compose word-splits a string
+    # command into separate argv entries, so `sh -c` would receive only the
+    # first word and the rest would become $0, $1, ...
+    command:
+      - |
+        set -e
+        BASE=http://pubsub:8085/v1/projects/local-project
+        # Idempotent: re-running `up`, or `run pull` (which re-triggers this
+        # dependency), must not fail. The emulator answers 409 ALREADY_EXISTS,
+        # which is success for our purposes.
+        put() {
+          code=$$(curl -sS -o /dev/null -w '%{http_code}' -X PUT "$$@")
+          case "$$code" in
+            200|409) ;;
+            *) echo "unexpected HTTP $$code for $$1" >&2; exit 1 ;;
+          esac
+        }
+        put "$$BASE/topics/webhook-events"
+        put "$$BASE/subscriptions/local-drain"           -H 'Content-Type: application/json'           -d '{"topic":"projects/local-project/topics/webhook-events"}'
+        echo "topic and subscription ready"
+  ingest:
+    build: .
+    depends_on:
+      topic-init: {condition: service_completed_successfully}
+    ports: ["8080:8080"]
+    environment:
+      PUBSUB_EMULATOR_HOST: pubsub:8085
+      GCP_PROJECT: local-project
+      PUBSUB_TOPIC: webhook-events
+      # Local only. Production reads this from Secret Manager.
+      WEBHOOK_SIGNING_SECRET: local-dev-key-not-a-real-credential  # pragma: allow-secret
+      WEBHOOK_SIGNING_KEY_HEADER: X-SigningKey
+      WEBHOOK_SOURCE: aptly
+      LOG_LEVEL: INFO
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # On demand, not part of `up`: subscribes and prints whatever is on the topic,
+  # so you can see the exact bytes and attributes the service published.
+  pull:
+    build: .
+    profiles: ["tools"]
+    depends_on:
+      topic-init: {condition: service_completed_successfully}
+    environment:
+      PUBSUB_EMULATOR_HOST: pubsub:8085
+      GCP_PROJECT: local-project
+      PUBSUB_TOPIC: webhook-events
+    entrypoint: ["python", "scripts/drain_topic.py"]
+    volumes:
+      - ./scripts:/app/scripts:ro

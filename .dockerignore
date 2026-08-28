@@ -1,0 +1,52 @@
+# Keep the build context minimal and the image free of anything secret.
+#
+# `.env` is the line that matters most: this repo is public and the image may
+# be pushed to a registry others can pull. A COPY . . with no .dockerignore
+# bakes whatever .env the developer happens to have straight into a layer,
+# where it survives even if a later layer deletes it.
+
+# --- Secrets — never in an image ---------------------------------------------
+.env
+*.env
+!.env.example
+*-key.json
+*credentials*.json
+service-account*.json
+id_rsa
+id_ed25519
+
+# --- Local environments ------------------------------------------------------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+.coverage
+htmlcov/
+
+# --- Version control and CI --------------------------------------------------
+.git/
+.gitignore
+.gitattributes
+.githooks/
+.github/
+
+# --- Not part of the runtime service -----------------------------------------
+# Tests run in CI, not in the container. Terraform provisions the service; it
+# does not ship inside it. README.md and LICENSE are NOT excluded: pyproject.toml
+# references both, so the build fails without them.
+tests/
+infra/
+docker-compose.yml
+*.md
+!README.md
+
+# --- Editor / OS -------------------------------------------------------------
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
