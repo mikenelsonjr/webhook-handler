@@ -114,3 +114,24 @@ variable "request_timeout_seconds" {
     error_message = "request_timeout_seconds must exceed ack_deadline_seconds, or Cloud Run kills the request before Pub/Sub gives up on it and the message is redelivered while the first attempt is still running."
   }
 }
+
+variable "subscription_retention" {
+  type        = string
+  default     = "604800s" # 7 days, the maximum
+  description = "How long the push subscription retains unacknowledged messages. The maximum by default: a message that cannot be delivered for a week is a message you want to still have."
+}
+
+variable "max_delivery_attempts" {
+  type        = number
+  default     = 5
+  description = <<-EOT
+    Deliveries before a message is moved to the dead-letter topic. Bounds how
+    long a poison message churns; without it, one the handler can never process
+    is retried until it ages out of retention. Range 5-100.
+  EOT
+
+  validation {
+    condition     = var.max_delivery_attempts >= 5 && var.max_delivery_attempts <= 100
+    error_message = "max_delivery_attempts must be between 5 and 100 (Pub/Sub's own range)."
+  }
+}

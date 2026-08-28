@@ -59,3 +59,13 @@ output "processor_url" {
   value       = google_cloud_run_v2_service.processor.uri
   description = "URL of the processor. The push subscription in #22 builds its endpoint and its OIDC audience from this, rather than from a hand-written copy."
 }
+
+output "push_subscription_name" {
+  value       = google_pubsub_subscription.processor_push.name
+  description = "The subscription delivering to the processor."
+}
+
+output "dead_letter_subscription_name" {
+  value       = google_pubsub_subscription.dead_letter.name
+  description = "Pull this to see what the processor could never handle."
+}

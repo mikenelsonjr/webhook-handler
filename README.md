@@ -353,6 +353,65 @@ Set the subscription's ack deadline above your handler's **worst case**, not
 its median: exceed it and Pub/Sub redelivers while the first attempt is still
 running, so the same event is processed twice concurrently.
 
+### Or deploy it all with Terraform
+
+`infra/` builds everything above — both services, both topics, all three
+service accounts, every IAM grant, and the push subscription — so you do not
+have to remember the grants that fail silently.
+
+```bash
+cd infra
+cp terraform.tfvars.example terraform.tfvars   # fill in project_id and region
+
+terraform init
+terraform apply \
+  -var 'ingest_image=REGION-docker.pkg.dev/PROJECT/repo/webhook-handler:TAG' \
+  -var 'processor_image=REGION-docker.pkg.dev/PROJECT/repo/webhook-handler:TAG'
+```
+
+Both images are the same build: the Dockerfile ships both entrypoints, and the
+processor runs `processor_main:app` via a command override.
+
+**One manual step, on purpose.** Terraform creates the secret but never a
+version, because a version's value would be written into Terraform state in
+plaintext. Add it once:
+
+```bash
+printf '%s' "$SIGNING_KEY" | \
+  gcloud secrets versions add "$(terraform output -raw signing_secret_id)" --data-file=-
+```
+
+`printf`, not `echo` — `echo` appends a newline, and a trailing newline in a
+shared secret produces a comparison failure that looks exactly like a wrong key.
+
+Then verify end to end. This is the same check the local stack makes, against
+real infrastructure:
+
+```bash
+curl -X POST "$(terraform output -raw ingest_url)/webhook" \
+  -H 'Content-Type: application/json' \
+  -H "x-signingkey: $SIGNING_KEY" \
+  -d '{"action":"update","data":{"_id":"abc"}}'
+# {"message_id":"...","event_id":"a76b8cc3..."}
+
+gcloud run services logs read "$(terraform output -raw processor_url | sed 's|.*//||;s|-[a-z0-9]*\..*||')" \
+  --region "$REGION" --limit 20
+```
+
+**The `event_id` in the response must appear in the processor's logs.** That
+one value spans both services, and seeing it on both sides is what proves the
+whole path — publish, push, authenticate, dedup, handle — rather than just the
+half you can curl.
+
+If it does not appear, the failure is almost certainly one of the three grants
+in the table above, none of which report an error. Check in this order:
+
+| Symptom | Look at |
+|---|---|
+| Processor logs are empty and no 403s | `serviceAccountTokenCreator` on the push SA — Pub/Sub cannot mint a token, so it never calls |
+| Processor logs show 403s | `roles/run.invoker` for the push SA, or an `audience` that does not match the service URL |
+| Messages retry forever, dead-letter topic empty | `pubsub.publisher` on the DLQ **and** `pubsub.subscriber` on the subscription |
+
 ## Security
 
 Secrets are gitignored and a pre-commit hook scans staged diffs for

@@ -55,3 +55,78 @@ resource "google_pubsub_subscription" "dead_letter" {
     ttl = ""
   }
 }
+
+# ==============================================================================
+# The push subscription: the thing that actually ties the two services
+# together, and where four settings decide how the system behaves when things
+# go wrong.
+# ==============================================================================
+resource "google_pubsub_subscription" "processor_push" {
+  name    = "${var.name_prefix}-processor-push"
+  topic   = google_pubsub_topic.events.id
+  labels  = var.labels
+  project = var.project_id
+
+  # Above the handler's WORST case, not its median. Exceed it and the message
+  # is redelivered while the first attempt is still running, so one event is
+  # processed twice concurrently. That is the standard way a push subscriber
+  # gets into trouble. var.request_timeout_seconds is validated to exceed this.
+  ack_deadline_seconds = var.ack_deadline_seconds
+
+  message_retention_duration = var.subscription_retention
+
+  push_config {
+    # Built from the service's own URL, never a hand-written copy: a copy
+    # drifts silently the first time the service is renamed, and the symptom is
+    # a 404 loop that looks like the processor being down.
+    push_endpoint = "${google_cloud_run_v2_service.processor.uri}/_pubsub/push"
+
+    oidc_token {
+      service_account_email = google_service_account.push.email
+
+      # Must match the service URL. Get this wrong and Cloud Run rejects every
+      # delivery before the container sees it — a 403 loop indistinguishable
+      # from a missing roles/run.invoker.
+      audience = google_cloud_run_v2_service.processor.uri
+    }
+  }
+
+  # Bounds how long a poison message churns. Without it, a message the handler
+  # can never process is retried until it ages out of retention: days of noise
+  # around one bad payload, and no record of it anywhere afterwards.
+  dead_letter_policy {
+    dead_letter_topic     = google_pubsub_topic.dead_letter.id
+    max_delivery_attempts = var.max_delivery_attempts
+  }
+
+  # Explicit backoff, so a downstream outage is not turned into a self-inflicted
+  # load test by a subscriber retrying flat out.
+  retry_policy {
+    minimum_backoff = "10s"
+    maximum_backoff = "600s"
+  }
+
+  # A subscription with no subscriber is deleted after 31 days by default. This
+  # one has a push endpoint rather than a puller, and there is no reason for it
+  # to disappear during a quiet month.
+  expiration_policy {
+    ttl = ""
+  }
+
+  depends_on = [
+    google_cloud_run_v2_service_iam_member.processor_push_only,
+    google_service_account_iam_member.pubsub_mints_push_tokens,
+  ]
+}
+
+# The third grant that fails silently, completing the set from iam.tf. Pub/Sub
+# must be able to ACK a message on THIS subscription in order to move it to the
+# dead-letter topic. Without it, dead-lettering is refused and the message
+# retries forever — the same symptom as a missing publisher grant on the
+# dead-letter topic, from the opposite side.
+resource "google_pubsub_subscription_iam_member" "pubsub_acks_for_dead_lettering" {
+  subscription = google_pubsub_subscription.processor_push.name
+  role         = "roles/pubsub.subscriber"
+  member       = local.pubsub_agent
+  project      = var.project_id
+}
