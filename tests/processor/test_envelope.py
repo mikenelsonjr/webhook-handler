@@ -187,15 +187,36 @@ def test_invalid_base64_raises_envelope_error():
 
 
 def test_base64_with_bad_padding_raises_envelope_error():
-    """`b64decode` without validate=True silently discards characters outside
-    the alphabet, so truncated data would decode to something plausible and
-    wrong rather than failing."""
+    """Truncated data. This one fails the padding check in either decode mode,
+    unlike the case below."""
     from processor.envelope import EnvelopeError
 
     truncated = base64.b64encode(PAYLOAD).decode()[:-3]
 
     with pytest.raises(EnvelopeError):
         parse(push_envelope(encoded_data=truncated))
+
+
+def test_base64_containing_non_alphabet_characters_raises_envelope_error():
+    """This is the case that needs `validate=True`, and it is the dangerous one.
+
+    A lax `b64decode` silently discards every character outside the base64
+    alphabet, so a corrupted payload decodes to something plausible and is
+    handed to the handler as though the provider had sent it:
+
+        >>> base64.b64decode('eyJh!!!bW91bnQiOjEwMH0=')
+        b'{"amount":100}'                      # junk stripped, no complaint
+
+    Corruption must be a rejected message, not a silently repaired one.
+    """
+    from processor.envelope import EnvelopeError
+
+    encoded = base64.b64encode(PAYLOAD).decode()
+    corrupted = encoded[:4] + "!!!" + encoded[4:]
+    assert base64.b64decode(corrupted) == PAYLOAD, "a lax decode accepts this"
+
+    with pytest.raises(EnvelopeError):
+        parse(push_envelope(encoded_data=corrupted))
 
 
 def test_data_that_is_not_a_string_raises_envelope_error():
