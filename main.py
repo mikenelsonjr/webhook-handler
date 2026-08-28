@@ -11,19 +11,19 @@ real webhook — which, since Aptly never retries, would be a lost event.
 
 from __future__ import annotations
 
-import logging
 import os
 
+from common.log import configure_logging
 from ingest.app import create_app
 from ingest.config import Settings
 from ingest.publisher import Publisher
 from ingest.pubsub_publisher import PubSubPublisher
 from ingest.retry import RetryingPublisher
 
-logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO"),
-    format='{"severity":"%(levelname)s","logger":"%(name)s","message":"%(message)s"}',
-)
+# Before anything else logs. The formatter emits `extra=` fields, which is what
+# puts `event_id` — the only identifier spanning ingest, topic, and processor —
+# into the output rather than merely onto the LogRecord.
+configure_logging(os.environ.get("LOG_LEVEL", "INFO"))
 
 settings = Settings.from_env(os.environ)
 

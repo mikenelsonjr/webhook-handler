@@ -76,8 +76,15 @@ class PubSubPublisher:
             auth_exceptions.GoogleAuthError,    # missing/invalid credentials
         ) as exc:
             # The message text can contain the full topic path, so it is logged
-            # rather than raised onward into a response body.
-            logger.debug("pubsub publish failed", exc_info=exc)
+            # rather than raised onward into a response body. This is the only
+            # line holding the real GCP error, so it carries the event_id too —
+            # otherwise the one log line that says *why* a publish failed cannot
+            # be tied to the delivery that failed.
+            logger.debug(
+                "pubsub publish failed",
+                exc_info=exc,
+                extra={"event_id": dict(attributes or {}).get("event_id", "")},
+            )
             raise PublishError(f"{type(exc).__name__} publishing to the topic") from exc
 
         except ValueError as exc:

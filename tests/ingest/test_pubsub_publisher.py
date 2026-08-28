@@ -161,6 +161,46 @@ def test_failure_message_does_not_repeat_the_topic_path(settings):
     assert settings.gcp_project not in str(exc.value)
 
 
+def test_the_debug_line_carries_the_event_id(settings):
+    """The GCP error text is logged here and deliberately kept out of the
+    response body — so this is the only line that says *why* a publish failed,
+    and it is worthless if you cannot tie it to a delivery. Issue #9."""
+    import io
+    import json
+    import logging
+
+    from common.log import JsonFormatter
+    from ingest.publisher import PublishError
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(JsonFormatter())
+    logger = logging.getLogger("ingest.pubsub_publisher")
+    logger.addHandler(handler)
+    # setLevel, NOT `logger.level = ...`. isEnabledFor() memoizes its answer in
+    # Logger._cache, and only setLevel() invalidates it. Earlier tests in this
+    # file already logged at DEBUG while the level was WARNING, so a direct
+    # assignment leaves the cached False in place and the record is dropped.
+    previous = logger.level
+    logger.setLevel(logging.DEBUG)
+
+    try:
+        pub, _ = _publisher(
+            FakeFuture(error=gcp_exceptions.NotFound('topic "webhook-events" is gone')),
+            settings,
+        )
+        with pytest.raises(PublishError):
+            pub.publish(b'{"a":1}', {"event_id": "e-42"})
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+
+    lines = [json.loads(line) for line in stream.getvalue().splitlines() if line.strip()]
+    assert lines, "the GCP failure should be logged at DEBUG"
+    assert all(line.get("event_id") == "e-42" for line in lines)
+    assert any("NotFound" in line.get("exception", "") for line in lines)
+
+
 def test_it_satisfies_the_publisher_protocol(settings):
     """Structural check: it can stand in wherever the route expects a Publisher."""
     from ingest.publisher import Publisher

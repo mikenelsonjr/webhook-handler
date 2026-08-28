@@ -38,8 +38,9 @@ dev = [
 [tool.setuptools.packages.find]
 # One distribution, two deployables: the webhook receiver and the Pub/Sub
 # subscriber. They share the message envelope, which is what `tests/contract/`
-# exists to pin down. Terraform lives in `infra/` and is not a Python package.
-include = ["ingest*", "processor*"]
+# exists to pin down. `common` holds only what both must agree on — today, the
+# log formatter. Terraform lives in `infra/` and is not a Python package.
+include = ["ingest*", "processor*", "common*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -55,3 +56,12 @@ select = ["E", "F", "I", "B", "UP", "S"]
 # S101 = assert, expected in tests. S105/S106 = "hardcoded password": the test
 # secrets are fixtures, and a signature suite cannot be written without them.
 per-file-ignores = { "tests/*" = ["S101", "S105", "S106"] }
+
+[tool.ruff.lint.isort]
+# Stated rather than inferred. Ruff guesses first-party from the source tree,
+# and the guess is not stable as packages are added — `processor` was sorted
+# into the third-party block while `ingest` was not, which makes import order
+# a moving target for anyone who clones this. Keep this table LAST: every key
+# after a `[table]` header belongs to it, so `per-file-ignores` above would
+# otherwise be read as an isort setting and fail to parse.
+known-first-party = ["ingest", "processor", "common", "tests"]

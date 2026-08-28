@@ -7,6 +7,10 @@ Logging with no severity and an indefinite retention policy.
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import io
+import json
 import logging
 
 from tests.ingest.conftest import FakePublisher, body_bytes, json_headers
@@ -77,18 +81,93 @@ def test_failure_log_does_not_contain_the_payload(make_client, caplog):
     assert CANARY not in caplog.text
 
 
-def test_log_records_carry_a_correlation_id(make_client, caplog):
-    """Without one you cannot tie a failure back to a specific delivery."""
-    caplog.set_level(logging.INFO)
-    client = make_client(FakePublisher())
+def _emitted_lines(stream) -> list[dict]:
+    return [json.loads(line) for line in stream.getvalue().splitlines() if line.strip()]
 
-    _post(client)
 
-    ingest_records = [r for r in caplog.records if r.name.startswith("ingest")]
-    assert ingest_records, "the service should log something at INFO for each request"
-    assert any(
-        hasattr(r, "event_id") or "event_id" in r.getMessage() for r in ingest_records
-    ), "log records should carry the event_id"
+@contextlib.contextmanager
+def capture_ingest_output():
+    """Capture what the ingest logger actually EMITS, formatted and parsed.
+
+    `caplog` captures records *before* formatting, which is precisely the blind
+    spot that let issue #9 ship: the old version of the correlation test
+    asserted `hasattr(record, "event_id")` and passed for months while the
+    configured formatter dropped every `extra=` field, so the emitted line
+    carried no event_id at all.
+    """
+    from common.log import JsonFormatter
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(JsonFormatter())
+
+    logger = logging.getLogger("ingest")
+    logger.addHandler(handler)
+    # setLevel, NOT `logger.level = ...`: isEnabledFor() memoizes its answer in
+    # Logger._cache and only setLevel() invalidates it, so a direct assignment
+    # can raise the level and still have records silently dropped.
+    previous = logger.level
+    logger.setLevel(logging.INFO)
+    try:
+        yield stream
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+
+
+def test_the_emitted_log_line_carries_the_event_id(make_client):
+    """Without one you cannot tie a delivery to a line — and `event_id` is the
+    only identifier that spans ingest, the topic, and the processor."""
+    with capture_ingest_output() as stream:
+        client = make_client(FakePublisher())
+        response = _post(client, {"event": "ping"})
+
+    lines = _emitted_lines(stream)
+    assert lines, "the service should log something at INFO for each request"
+
+    event_id = response.json()["event_id"]
+    assert any(line.get("event_id") == event_id for line in lines), (
+        f"no emitted line carried event_id={event_id}: {lines}"
+    )
+
+
+def test_the_emitted_failure_line_carries_the_event_id(make_client):
+    """The 503 path is the one you most need to trace back to a delivery."""
+    from ingest.publisher import PublishError
+
+    with capture_ingest_output() as stream:
+        client = make_client(FakePublisher(fail_with=PublishError("topic vanished")))
+        response = _post(client)
+
+    assert response.status_code == 503
+    errors = [line for line in _emitted_lines(stream) if line["severity"] == "ERROR"]
+    assert errors, "a failed publish must be emitted at ERROR"
+    assert all("event_id" in line for line in errors)
+
+
+def test_the_emitted_retry_warning_carries_the_event_id(make_client):
+    """`RetryingPublisher` logs each failed attempt. Without the event_id you
+    cannot tell whether one delivery retried three times or three deliveries
+    failed once each — which is the difference between a blip and an outage."""
+    from ingest.publisher import PublishError
+    from ingest.retry import RetryingPublisher
+
+    inner = FakePublisher(fail_with=PublishError("transient"))
+    publisher = RetryingPublisher(inner, attempts=3, backoff_seconds=0, sleep=lambda _: None)
+
+    # Every attempt fails, so the response is a 503 with no event_id in it —
+    # the logs are the only place the id exists, which is the point.
+    body = body_bytes({"customer_email": CANARY})
+    expected = hashlib.sha256(body).hexdigest()
+
+    with capture_ingest_output() as stream:
+        client = make_client(publisher)
+        response = client.post("/webhook", content=body, headers=json_headers())
+
+    assert response.status_code == 503
+    warnings = [line for line in _emitted_lines(stream) if line["severity"] == "WARNING"]
+    assert len(warnings) == 2, f"expected a warning per non-final attempt, got {warnings}"
+    assert all(line.get("event_id") == expected for line in warnings)
 
 
 def test_successful_request_is_logged(make_client, caplog):

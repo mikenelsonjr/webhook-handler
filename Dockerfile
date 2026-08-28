@@ -19,6 +19,11 @@ RUN mkdir -p ingest && touch ingest/__init__.py \
 
 # --- application layer --------------------------------------------------------
 COPY ingest/ ./ingest/
+# `common` holds the JSON log formatter that main.py configures at import. Omit
+# it and the container starts, fails the import, and Cloud Run reports an
+# unhealthy revision with no application log to explain why — the logging setup
+# is what died.
+COPY common/ ./common/
 COPY main.py ./
 # Reinstall the real package over the stub. --no-deps because the dependency
 # layer above already resolved everything.

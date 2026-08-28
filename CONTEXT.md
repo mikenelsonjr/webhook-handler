@@ -19,11 +19,14 @@ loss.
 
 ## Status
 
-Being rebuilt from a working Cloud Function original. The failing acceptance
-suite in `tests/` defines the target; the implementation is in progress.
-Findings tracked as issues 1–7 in the
+`ingest/` is complete: rebuilt from a working Cloud Function original, 114
+tests, driven end to end against a Pub/Sub emulator. Issues 1–8 in the
 [catalog repo](https://github.com/mikenelsonjr/Accelerators/issues),
-labelled `epic:harden-ingest`.
+labelled `epic:harden-ingest`, are closed.
+
+`processor/` is designed but not built — the section below is the design, and
+`infra/` (Terraform for the Cloud Run services, topic, push subscription, and
+dead-letter topic) follows it.
 
 ## Decisions
 
@@ -142,8 +145,9 @@ mode worth designing against.
 
 ```
 ingest/       FastAPI receiver -> publishes to the topic
-processor/    subscriber stub  -> reads from the topic
-infra/        Terraform: Cloud Run service, topic, subscription, IAM
+processor/    push subscriber  -> Pub/Sub POSTs the message here
+common/       the little that both deployables must agree on (log formatter)
+infra/        Terraform: Cloud Run services, topic, push subscription, IAM
 tests/
   conftest.py           repo-wide helpers
   test_dependencies.py  manifest + stdlib integrity
@@ -161,7 +165,7 @@ Terraform is **not** driven from pytest. `terraform fmt -check`, `validate`,
 and `tflint` run as a separate CI job — folding them in would mean the Python
 suite needs a Terraform toolchain on PATH to run at all.
 
-## Interface
+## Interface — ingest
 
 ```
 ingest/
@@ -211,6 +215,284 @@ there is no better source. Two consequences worth knowing:
 
 `received_at` deliberately varies per delivery. `event_id` identifies the
 event; `received_at` identifies the attempt.
+
+---
+
+# The processor
+
+Ingest's rule is *a 2xx is a promise* — do not acknowledge until the message is
+durable. The processor is that same sentence read from the other end:
+
+> **A 2xx means "never send me this again."**
+
+Every design decision below falls out of taking that literally.
+
+## Push, not pull
+
+Pub/Sub POSTs each message to an HTTPS endpoint on Cloud Run. The alternative —
+a long-running worker holding a `StreamingPull` — was rejected for three
+reasons:
+
+- **It scales to zero.** A pull subscriber must be running to receive anything,
+  so it needs `min-instances=1` or a VM, and it idles at full cost between
+  webhooks. Push instances exist only while a message is being handled.
+- **Pub/Sub already owns retry.** Backoff, the redelivery ceiling, and the
+  dead-letter topic are subscription settings. A pull subscriber reimplements
+  the first two in application code and gets them subtly wrong.
+- **A push body is plain JSON over HTTP.** The processor imports nothing from
+  `google.cloud` — no grpc toolchain, no credentials, no `[gcp]` extra to run
+  its suite. Ingest had to fight for that property (see the injected-publisher
+  decision above); the processor gets it for free.
+
+What is given up: no flow control beyond Cloud Run's concurrency and
+`max-instances`, no ordering keys, and a hard ceiling on how long one message
+may take (below). Those are the conditions under which pull is the right
+answer, and the upgrade path is deliberately short — `Handler` knows nothing
+about HTTP, so a pull runner drives the same handler unchanged.
+
+## The response code *is* the ack
+
+| Outcome | Response | Meaning to Pub/Sub |
+|---|---|---|
+| Handled successfully | 204 | ack — delete it |
+| `event_id` already handled | 204 | ack — it was done the first time |
+| **Envelope unparseable / payload undecodable** | **204** | ack — see below |
+| Handler raised `PermanentError` | 204 | ack — this will never succeed |
+| Handler raised `RetryableError` | 503 | nack — redeliver with backoff |
+| Any unexpected exception | 503 | nack — redeliver with backoff |
+| Request did not come from Pub/Sub | 401 | not an ack decision at all |
+
+**Acking a malformed envelope is the non-obvious one, and it is the whole
+point.** In push delivery *any* non-2xx is a nack, so the reflexive
+`400 Bad Request` on unparseable input tells Pub/Sub to send it again — and it
+will, with backoff, until the message ages out of the retention window seven
+days later. Bad bytes do not become good bytes on the third attempt. So the
+processor logs it, acks it, and moves on; the dead-letter topic is where such
+a message goes to be looked at, not the redelivery loop.
+
+Note where this **differs from `RetryingPublisher`**, which retries only
+`PublishError` and lets anything unexpected propagate on the grounds that an
+unknown failure is a bug and retrying just buries it. Here an unknown exception
+nacks. The difference is the backstop: Pub/Sub retries a bounded number of
+times and then dead-letters, so an unknown failure is investigated from the
+DLQ rather than lost, and a genuinely transient fault gets the second chance it
+deserves. In-process retry had no such ceiling and no such dead-letter.
+
+## The ack deadline bounds the work
+
+Pub/Sub gives a push endpoint a fixed window to respond — 10 seconds by
+default, settable to 600. Exceed it and the message is redelivered **while the
+first attempt is still running**, so the same event is processed twice
+concurrently. That is not a hypothetical: it is the standard way a push
+subscriber gets into trouble.
+
+Two consequences, both of which belong in `infra/`:
+
+- `ackDeadlineSeconds` must exceed the handler's worst case, not its median.
+- Cloud Run's request timeout must exceed the ack deadline, or the platform
+  kills the request before Pub/Sub gives up on it.
+
+Work that cannot fit under a sane deadline does not belong in the handler.
+Publish to a second topic or enqueue a Cloud Task and ack — the same
+accept-fast-process-later move ingest makes, one layer down.
+
+## Authentication: enforced by the platform, with a seam
+
+Pub/Sub signs each push request with an OIDC token when the subscription is
+configured with a service account. Deploy with `--no-allow-unauthenticated` and
+grant that account `roles/run.invoker`, and **Cloud Run validates the token
+before the request reaches the container** — the application then needs no
+verification code at all, and the endpoint is unreachable from the internet.
+
+That is the intended production posture. But it is not the only one — the local
+emulator sends no token, and a consumer running this outside Cloud Run has
+nothing validating anything — so verification stays a seam, `PUSH_AUTH_MODE`,
+with **no default**:
+
+| Mode | Meaning | Where |
+|---|---|---|
+| `oidc` | Verify the bearer token in-process: signature, audience, and the `email` claim against `PUSH_SERVICE_ACCOUNT`. | Non-Cloud-Run hosting, or defence in depth |
+| `trusted` | Something in front of this service already authenticated the caller — or nothing has. | Cloud Run + IAM (real), local emulator (nothing) |
+
+Naming the second mode `trusted` rather than `platform` is deliberate: it means
+"this service is trusting its network", which is true on Cloud Run and equally
+true on a laptop, and it should read uncomfortably enough that nobody sets it by
+accident. Requiring the variable follows ingest's rule that **configuration
+failures crash the container at startup** — there is no safe default here, so
+there is no default.
+
+`oidc` mode is one function, `verify_push_token`, called from one place, mirroring
+`verify_signing_key` on the ingest side.
+
+## Idempotency is the processor's problem
+
+The system is at-least-once by construction, from two independent sources:
+
+1. `RetryingPublisher` retries a publish that timed out *after* Pub/Sub stored
+   the message, producing two topic messages for one webhook.
+2. Pub/Sub redelivers on every nack and every missed ack deadline.
+
+So `dedup.py` defines a `SeenStore` protocol — `claim(event_id) -> bool`,
+`release(event_id)` — and ships `InMemorySeenStore`, a bounded TTL map.
+
+**Be clear about what the in-memory one buys you: nothing across instances.**
+Cloud Run runs N containers and a redelivery lands wherever the load balancer
+sends it. It defuses a rapid redelivery storm hitting a warm instance, and it
+makes the seam real and tested. It is not a distributed guarantee, and the
+accelerator must say so where someone will read it rather than only here. The
+production implementation is a Firestore create-if-absent with a TTL field, or
+a Redis `SET NX EX`, behind the same two methods.
+
+**When the store is written matters more than which store it is.** Recording
+`event_id` *before* handling means a crash mid-handle leaves the event marked
+done and it is never processed — silent loss, the failure ingest was built to
+avoid. Recording *after* means a crash leaves it unclaimed and it is processed
+twice. The claim/release shape splits the difference: claim before, release on
+failure so a redelivery may retry, leave the claim standing on success. It
+still favours duplicates over loss when a process dies between the two, which
+is the same tradeoff the rest of the service makes deliberately.
+
+Two properties of `event_id` are inherited from ingest and worth re-reading
+before leaning on dedup: it is a SHA-256 of the raw body, so it only dedups a
+sender retry if the sender replays **identical bytes** (unverified for Aptly —
+the payload carries moving `viewedAt`/`lockUntil` timestamps), and two
+genuinely distinct events with byte-identical bodies would collide and the
+second would be dropped.
+
+## The envelope, and why `tests/contract/` exists
+
+Pub/Sub wraps the published message; the processor unwraps it:
+
+```json
+{
+  "message": {
+    "data": "<base64 of the exact bytes the provider sent>",
+    "attributes": {"event_id": "...", "source": "aptly", "received_at": "..."},
+    "messageId": "12345",
+    "publishTime": "2026-08-28T15:04:05.000Z"
+  },
+  "subscription": "projects/<p>/subscriptions/<s>",
+  "deliveryAttempt": 3
+}
+```
+
+`data` is base64 of the **raw provider body**, because ingest publishes the
+bytes untouched — so a processor can still re-verify a provider signature, or
+diff against what the provider claims it sent. That property is only worth
+anything if both sides agree it holds, which is what the contract suite is for:
+it feeds ingest's published output straight into the processor's parser and
+asserts byte-fidelity and the three attributes. Neither component's own suite
+can catch that drift, because each would be asserting its own assumption.
+
+`deliveryAttempt` is present **only** when the subscription has a dead-letter
+policy, so it is read as an optional field and used for logging, never
+required. Its absence is a subscription-configuration fact, not an error.
+
+Poison-pill handling is the subscription's `deadLetterPolicy`
+(`maxDeliveryAttempts: 5`), not an in-application counter — an in-app counter
+is per-instance, so it counts a fraction of the attempts and reports a number
+that is confidently wrong.
+
+## Logging: `event_id` is the trace key
+
+`event_id` is the only identifier that spans the whole path — it is computed at
+ingest, published as an attribute, and arrives intact at the processor. Nothing
+else does that job:
+
+| Field | Spans the path? | What it identifies |
+|---|---|---|
+| `event_id` | **yes** | the event itself |
+| `message_id` | no — assigned per publish | one message on the topic; a duplicate publish of the same event has a different one |
+| `received_at` | no — regenerated per delivery | the ingest attempt |
+| `delivery_attempt` | no — per redelivery | how close this message is to the DLQ |
+
+So **every processor log line carries `event_id`**, and one value grepped
+across both services returns the complete story: received, published,
+delivered, handled or dead-lettered. Log `message_id` and `delivery_attempt`
+alongside it — a climbing `delivery_attempt` is the signal that something is
+heading for the dead-letter topic, and it is visible nowhere else.
+
+**The formatter has to actually render them, which today's does not.**
+`logging.basicConfig(format=...)` in `main.py` hand-builds JSON from a fixed
+`%`-style string, so fields passed via `extra=` are set on the `LogRecord` and
+then silently dropped — ingest currently passes `event_id` on every publish and
+emits none of it. Adding `%(event_id)s` does not fix it: any record lacking the
+attribute (uvicorn's, or a library's) then fails to format. It needs a
+`logging.Formatter` subclass that serializes the record's non-standard
+attributes through `json.dumps`. That also fixes the second bug in the same
+line — interpolating a message containing a `"` produces invalid JSON, so
+Cloud Logging demotes exactly the error line you were trying to trace to an
+unparsed blob.
+
+Both services need the identical formatter, so it lives in `common/log.py`
+rather than being copied into two entrypoints. Duplicating twenty lines is
+cheaper right up until the two halves of one trace disagree about what a field
+is called, which is the moment the trace was supposed to be useful.
+
+The `severity` key is kept: Cloud Logging reads that name specifically and maps
+it to the real log level, rather than filing everything as `DEFAULT`.
+
+`test_logging.py`'s payload-leak tests carry over to the processor and matter
+more there. Ingest never decodes the body — it hashes opaque bytes — while the
+processor holds the decoded payload in hand, so a leak is one careless
+`logger.debug("handling %s", event)` away. `Event.__repr__` should not include
+`data` for the same reason.
+
+## Interface — processor
+
+```
+processor/
+  config.py     Settings + from_env — pure function of a mapping, as ingest
+  envelope.py   parse_push_envelope(body) -> Event; EnvelopeError
+  security.py   verify_push_token — the OIDC seam
+  dedup.py      SeenStore protocol + InMemorySeenStore
+  handler.py    Handler protocol, RetryableError, PermanentError, LoggingHandler
+  app.py        create_app(settings, handler, seen) -> FastAPI
+
+common/
+  log.py        JsonFormatter + configure_logging — used by BOTH entrypoints
+```
+
+`common/` is kept deliberately thin. It holds the log formatter because a trace
+spanning two services needs one spelling of `event_id`, and nothing else: the
+message envelope stays pinned by `tests/contract/` rather than by a shared
+constants module, so neither side can quietly redefine the contract by editing
+a file it owns.
+
+| Route | Auth | Success | Notes |
+|---|---|---|---|
+| `GET /healthz` | none | 200 | as ingest — the prober has no identity |
+| `POST /_pubsub/push` | `PUSH_AUTH_MODE` | 204 | body empty; the status *is* the ack |
+
+`Event` is a frozen dataclass: `event_id`, `source`, `received_at`, `data`
+(decoded bytes), `message_id`, `publish_time`, `delivery_attempt: int | None`.
+
+`LoggingHandler` is the starter's default — it logs the `event_id` and payload
+size and does nothing else. It exists so the service is runnable end to end on
+day one and so the swap point is a single named thing rather than a TODO.
+
+| Variable | Required | Default | Notes |
+|---|---|---|---|
+| `PUSH_AUTH_MODE` | yes | — | `oidc` or `trusted`; no default, by design |
+| `PUSH_SERVICE_ACCOUNT` | if `oidc` | — | expected `email` claim |
+| `PUSH_AUDIENCE` | if `oidc` | — | expected `aud` claim |
+| `DEDUP_TTL_SECONDS` | no | 3600 | in-memory store only |
+| `DEDUP_MAX_ENTRIES` | no | 10000 | bounds the map; oldest evicted |
+| `LOG_LEVEL` | no | `INFO` | |
+
+## Local development
+
+`docker-compose.yml` gains a `processor` service, and `topic-init` creates a
+**push** subscription aimed at `http://processor:8080/_pubsub/push` — the
+emulator supports push, so the full path runs locally with no GCP at all. The
+emulator sends no OIDC token, which is exactly why `PUSH_AUTH_MODE=trusted`
+exists and why it is spelled that way.
+
+The existing `local-drain` pull subscription stays. Each subscription gets its
+own copy of every message, so `docker compose run --rm pull` still shows what
+was published even though the processor is consuming in parallel — which makes
+"did ingest publish it?" and "did the processor handle it?" two separately
+answerable questions instead of one confusing one.
 
 ## Testing
 
