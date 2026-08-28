@@ -24,7 +24,12 @@ COPY ingest/ ./ingest/
 # unhealthy revision with no application log to explain why — the logging setup
 # is what died.
 COPY common/ ./common/
-COPY main.py ./
+# One image, two deployables. The receiver runs `main:app`; the subscriber runs
+# `processor_main:app` via a command override (see docker-compose.yml and the
+# Cloud Run deploy in README). Shipping both costs a few KB and removes a whole
+# class of drift between two images built from one repo.
+COPY processor/ ./processor/
+COPY main.py processor_main.py ./
 # Reinstall the real package over the stub. --no-deps because the dependency
 # layer above already resolved everything.
 RUN pip install --no-deps .
