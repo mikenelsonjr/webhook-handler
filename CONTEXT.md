@@ -30,10 +30,18 @@ the ingest response and the processor's log line.
 was silently dropping every `extra=` field. All are closed in the
 [catalog repo](https://github.com/mikenelsonjr/Accelerators/issues).
 
-**`infra/` is the remaining piece** — Terraform for the Cloud Run services, the
-topic, the push subscription, and the dead-letter topic. The decisions it needs
-are already made below: the ack deadline bound, the DLQ policy, and the three
-IAM grants that fail silently.
+`infra/` provisions all of it in Terraform (`epic:build-infra`, issues 17–22):
+both services, both topics, three service accounts, every IAM grant, and the
+push subscription.
+
+**This is a template, and it is complete as one.** Nothing here has been
+applied to a GCP project, and that is the design rather than an omission — the
+consumer applies it to theirs. So the Terraform is verified to the level that
+is meaningful without a project: `terraform fmt`, `validate`, `tflint` with the
+Google ruleset, and variable validation exercised through `plan` (which checks
+variables before it authenticates). What that cannot catch is IAM that is
+valid-but-wrong, which is exactly why the three grants that fail silently are
+called out in comments, in the README's triage table, and here.
 
 ## Decisions
 
