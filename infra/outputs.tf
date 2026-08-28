@@ -44,3 +44,8 @@ output "pubsub_service_agent" {
   value       = trimprefix(local.pubsub_agent, "serviceAccount:")
   description = "Google's own Pub/Sub identity. Output because two of the grants that fail silently are made TO it, and knowing the address is half of debugging them."
 }
+
+output "signing_secret_id" {
+  value       = google_secret_manager_secret.signing.secret_id
+  description = "Short id of the signing secret. Add the first VERSION out of band; Terraform deliberately does not manage one."
+}
