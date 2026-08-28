@@ -9,3 +9,18 @@ output "project_id" {
   value       = var.project_id
   description = "The project everything above was created in. Echoed back so a plan output records it."
 }
+
+output "events_topic_id" {
+  value       = google_pubsub_topic.events.id
+  description = "Fully-qualified id of the events topic, for the dead-letter and push subscriptions."
+}
+
+output "events_topic_name" {
+  value       = google_pubsub_topic.events.name
+  description = "Short name, which is what the receiver's PUBSUB_TOPIC environment variable wants."
+}
+
+output "dead_letter_topic_id" {
+  value       = google_pubsub_topic.dead_letter.id
+  description = "Target of the push subscription's dead_letter_policy in #22."
+}
