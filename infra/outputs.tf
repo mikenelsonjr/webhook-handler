@@ -49,3 +49,13 @@ output "signing_secret_id" {
   value       = google_secret_manager_secret.signing.secret_id
   description = "Short id of the signing secret. Add the first VERSION out of band; Terraform deliberately does not manage one."
 }
+
+output "ingest_url" {
+  value       = google_cloud_run_v2_service.ingest.uri
+  description = "Public URL of the receiver. This is the endpoint you give the webhook provider."
+}
+
+output "processor_url" {
+  value       = google_cloud_run_v2_service.processor.uri
+  description = "URL of the processor. The push subscription in #22 builds its endpoint and its OIDC audience from this, rather than from a hand-written copy."
+}

@@ -59,6 +59,54 @@ def test_no_secret_data_attribute_anywhere():
     assert not offenders, f"secret material assigned in Terraform at {offenders}"
 
 
+def _resource_blocks(path: pathlib.Path) -> list[str]:
+    """Split a .tf file into top-level blocks, crudely but adequately.
+
+    A real HCL parse would mean a dependency; splitting on column-zero
+    `resource` is enough to attribute an attribute to the resource it sits in,
+    which is all these guards need.
+    """
+    text = path.read_text(encoding="utf-8")
+    blocks, current = [], []
+    for line in text.splitlines():
+        if line.startswith("resource "):
+            if current:
+                blocks.append("\n".join(current))
+            current = [line]
+        elif current:
+            current.append(line)
+    if current:
+        blocks.append("\n".join(current))
+    return blocks
+
+
+def test_only_the_receiver_is_publicly_invokable():
+    """The processor must never carry an `allUsers` invoker binding.
+
+    Pub/Sub *can* present a Google identity, so requiring one costs nothing and
+    is what `PUSH_AUTH_MODE=iam` asserts is true — the application performs no
+    verification of its own precisely because Cloud Run already did. A public
+    binding here would leave the endpoint open AND the application trusting it,
+    which is the one combination that has no defence at all.
+
+    The receiver is public on purpose: a provider that cannot authenticate has
+    no token to present.
+    """
+    public = [
+        (path.name, block.splitlines()[0])
+        for path in infra_sources()
+        for block in _resource_blocks(path)
+        if '"allUsers"' in block
+    ]
+
+    for filename, header in public:
+        assert "ingest" in header, (
+            f"{filename}: a public invoker binding on {header!r}. Only the "
+            "receiver may be public; the processor is called by Pub/Sub, which "
+            "can authenticate."
+        )
+
+
 def test_secret_access_is_granted_on_one_secret_not_the_project():
     """A project-level `secretAccessor` lets a compromised receiver read every
     secret in the project, which for most projects includes the database
