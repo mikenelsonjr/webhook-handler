@@ -42,17 +42,25 @@ import logging
 
 from fastapi import FastAPI, Request, Response
 
-from processor.config import Settings
+from processor.config import NONE, OIDC, Settings
 from processor.envelope import EnvelopeError, parse_push_envelope
 from processor.handler import Handler, PermanentError, RetryableError
+from processor.security import verify_push_token
 
 logger = logging.getLogger(__name__)
 
 ACK = 204
 NACK = 503
+UNAUTHORIZED = 401
 
 
-def create_app(settings: Settings, handler: Handler, seen=None) -> FastAPI:
+def create_app(
+    settings: Settings,
+    handler: Handler,
+    seen=None,
+    *,
+    verify=verify_push_token,
+) -> FastAPI:
     """Build the processor application.
 
     ``seen`` is the idempotency store and is accepted but unused until #13.
@@ -60,18 +68,56 @@ def create_app(settings: Settings, handler: Handler, seen=None) -> FastAPI:
     retrying a publish that timed out after the message was already stored — so
     until that story lands, a duplicate is dispatched to the handler twice and
     the handler must be idempotent on its own.
+
+    ``verify`` is injected so the authenticated path is testable with no
+    network and no credentials.
     """
     # Docs are disabled: the only caller is Pub/Sub, and an interactive schema
     # browser is attack surface with no audience.
     app = FastAPI(title="Webhook processor", docs_url=None, redoc_url=None, openapi_url=None)
 
+    if settings.push_auth_mode == NONE:
+        # Legitimate against the emulator, which sends no token, and an alarm
+        # anywhere else. Logged rather than refused because refusing would make
+        # local development impossible — but it must be visible in the logs of
+        # a deployment that reached this state by accident.
+        logger.warning(
+            "PUSH_AUTH_MODE=none: this endpoint is unauthenticated. "
+            "Local development only — production wants iam or oidc.",
+            extra={"push_auth_mode": settings.push_auth_mode},
+        )
+
     @app.get("/healthz")
     async def healthz() -> Response:
-        """Liveness probe. Unauthenticated — Cloud Run's prober has no identity."""
+        """Liveness probe. Unauthenticated — Cloud Run's prober has no identity,
+        so requiring a token here would make the revision permanently unhealthy."""
         return Response(status_code=200)
 
     @app.post("/_pubsub/push")
     async def push(request: Request) -> Response:
+        # 0. Authenticate, before anything that would reveal another fault.
+        #    In `iam` mode Cloud Run already did this and the request could not
+        #    have arrived otherwise; in `none` mode there is nothing to check.
+        if settings.push_auth_mode == OIDC:
+            authorization = request.headers.get("Authorization")
+            # The absent-header case is refused here rather than delegated, so
+            # a swapped-in verifier that mishandles None cannot turn "no
+            # credential at all" into an accepted request.
+            if not authorization or not verify(
+                authorization,
+                audience=settings.push_audience,
+                service_account=settings.push_service_account,
+            ):
+                # Logged by the endpoint, not only by the verifier: this is the
+                # record that a request was refused, and it has to exist
+                # whatever decided it. The header is never logged — it carries
+                # a live bearer credential.
+                logger.warning("rejecting unauthenticated push request")
+                # 401, not 204: this is not an acknowledgement decision at all.
+                # A real Pub/Sub delivery is authenticated, so a request that
+                # is not is something else, and Pub/Sub is not waiting on it.
+                return Response(status_code=UNAUTHORIZED)
+
         body = await request.body()
 
         # 1. Parse. A failure here is permanent by construction: nothing in the

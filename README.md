@@ -151,6 +151,8 @@ will need a real topic and credentials.
 
 ## Deploy
 
+### Ingest
+
 ```bash
 gcloud run deploy webhook-handler \
   --source . \
@@ -169,6 +171,74 @@ working before the endpoint is reachable: an unset secret fails closed, so the
 failure mode is a service that rejects everything rather than one that accepts
 everything, but verify rather than assume. Restrict ingress to the provider's
 IP ranges if they publish them.
+
+### The processor
+
+The processor is a **push** subscriber: Pub/Sub POSTs each message to it over
+HTTPS, so it scales to zero and Pub/Sub owns retry, backoff, and the
+dead-letter policy. Deploy it with authentication **on**:
+
+```bash
+gcloud run deploy webhook-processor \
+  --source . \
+  --region us-central1 \
+  --no-allow-unauthenticated \
+  --set-env-vars PUSH_AUTH_MODE=iam
+```
+
+`PUSH_AUTH_MODE=iam` means *Cloud Run already authenticated the caller*. With
+`--no-allow-unauthenticated`, the platform validates the Pub/Sub OIDC token
+before the request reaches the container, so the application needs no
+verification code and the endpoint is unreachable from the internet. There is
+**no default** for this variable — an unset or unrecognised value crashes the
+container at startup, so Cloud Run keeps the previous revision serving and a
+typo cannot ship an open endpoint.
+
+| Mode | Use it when |
+|---|---|
+| `iam` | Cloud Run with `--no-allow-unauthenticated`. **The production setting.** |
+| `none` | Local emulator only. Warns loudly at startup. |
+| `oidc` | Not on Cloud Run, or you want the app to pin `aud`/`email` itself. Needs `pip install '.[oidc]'`. |
+
+**Two service accounts, not one.** The *push* service account is the identity
+Pub/Sub uses to call the service; the service's own *runtime* identity is
+separate and needs only what your handler touches. Do not reuse one for both —
+the push account should have no permissions beyond invoking this service.
+
+#### Three grants that fail silently
+
+Nothing errors when these are missing. Delivery just stops, or the dead-letter
+topic stays empty while the retry count climbs, which looks exactly like a
+broken consumer:
+
+| Grant | On | Symptom if missing |
+|---|---|---|
+| `roles/run.invoker` → push SA | the Cloud Run service | 403 on every push; redelivered until retention expires |
+| `roles/iam.serviceAccountTokenCreator` → the Pub/Sub service agent | the **push SA** | Pub/Sub cannot mint the token; the subscription never delivers |
+| `roles/pubsub.publisher` → the Pub/Sub service agent | the **dead-letter topic** | dead-lettering never happens; poison messages retry forever |
+
+The service agent is `service-<PROJECT_NUMBER>@gcp-sa-pubsub.iam.gserviceaccount.com`.
+The last two catch people out because they are grants *to Google's own
+identity*, on resources the operator is not thinking about while wiring up a
+subscription.
+
+```bash
+PROJECT_NUMBER=$(gcloud projects describe "$PROJECT" --format='value(projectNumber)')
+AGENT="service-${PROJECT_NUMBER}@gcp-sa-pubsub.iam.gserviceaccount.com"
+
+gcloud run services add-iam-policy-binding webhook-processor \
+  --member="serviceAccount:${PUSH_SA}" --role=roles/run.invoker --region us-central1
+
+gcloud iam service-accounts add-iam-policy-binding "$PUSH_SA" \
+  --member="serviceAccount:${AGENT}" --role=roles/iam.serviceAccountTokenCreator
+
+gcloud pubsub topics add-iam-policy-binding webhook-events-dead-letter \
+  --member="serviceAccount:${AGENT}" --role=roles/pubsub.publisher
+```
+
+Set the subscription's ack deadline above your handler's **worst case**, not
+its median: exceed it and Pub/Sub redelivers while the first attempt is still
+running, so the same event is processed twice concurrently.
 
 ## Security
 

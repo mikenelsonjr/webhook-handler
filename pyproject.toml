@@ -26,6 +26,13 @@ dependencies = [
 gcp = [
     "google-cloud-pubsub~=2.23",
 ]
+# Verifying a Pub/Sub push token in-process, for PUSH_AUTH_MODE=oidc only. On
+# Cloud Run with --no-allow-unauthenticated the platform has already validated
+# the token, so `iam` deployments never install this and never pay the
+# public-key fetch. Much lighter than [gcp]: google-auth pulls no grpc.
+oidc = [
+    "google-auth~=2.35",
+]
 dev = [
     "pytest~=8.3",
     # Starlette's TestClient deprecated httpx in favour of httpx2; the old one
