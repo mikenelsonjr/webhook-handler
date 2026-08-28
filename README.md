@@ -114,14 +114,15 @@ pip install -e ".[dev,gcp]"
 
 ### Running the whole thing
 
-`docker compose` brings the service up against a **Pub/Sub emulator** — no GCP
-project, no credentials, and no way to write to a real topic by accident. The
-client switches to the emulator purely because `PUBSUB_EMULATOR_HOST` is set;
-nothing in the application code knows the difference.
+`docker compose` brings **both services** up against a **Pub/Sub emulator** — no
+GCP project, no credentials, and no way to write to a real topic by accident.
+The client switches to the emulator purely because `PUBSUB_EMULATOR_HOST` is
+set; nothing in the application code knows the difference.
 
 ```bash
 docker compose up --build
-curl -sS localhost:8080/healthz
+curl -sS localhost:8080/healthz     # ingest
+curl -sS localhost:8081/healthz     # processor
 ```
 
 Send a delivery shaped like a real one (the key matches `docker-compose.yml`):
@@ -131,23 +132,49 @@ curl -X POST localhost:8080/webhook \
   -H 'Content-Type: application/json' \
   -H 'x-signingkey: local-dev-key-not-a-real-credential' \
   -d '{"action":"update","data":{"_id":"abc"}}'
-# {"message_id":"1","event_id":"cf709a70..."}
+# {"message_id":"1","event_id":"a76b8cc3..."}
 ```
 
-Then read exactly what landed on the topic — raw bytes and attributes:
+The emulator then **pushes** that message to the processor, exactly as Pub/Sub
+does to Cloud Run. Watch it arrive:
+
+```bash
+docker compose logs processor
+# {"severity":"INFO","logger":"processor.handler","message":"event received",
+#  "event_id":"a76b8cc3...","source":"aptly","message_id":"1","payload_bytes":39}
+```
+
+**The `event_id` in the ingest response and in the processor's log line are the
+same value.** That is what it is for, and this is where you can see it working:
+one id, grepped across both services, returns the whole story.
+
+Read the exact bytes that landed on the topic — raw body and attributes:
 
 ```bash
 docker compose run --rm pull
 docker compose down -v          # stop and discard emulator state
 ```
 
-`topic-init` creates the topic **and** the subscription before the service
-starts. Both are needed up front: Pub/Sub only retains a message for
-subscriptions that already existed when it was published, so creating the
-subscription later leaves everything sent so far silently unreadable.
+`topic-init` creates the topic and **both** subscriptions before ingest starts:
+a pull subscription for `run --rm pull`, and the push subscription that feeds
+the processor. Each gets its own copy of every message, so they do not compete
+— which keeps *did ingest publish it?* and *did the processor handle it?* two
+separately answerable questions. All of it has to exist up front: Pub/Sub only
+retains a message for subscriptions that already existed when it was published,
+so creating one later leaves everything sent so far silently unreadable.
 
-Without Docker, `uvicorn main:app --reload --env-file .env` works too, but you
-will need a real topic and credentials.
+The processor runs `PUSH_AUTH_MODE=none` here, because the emulator sends no
+OIDC token. It warns loudly at startup, and it is the one mode that must never
+reach production — see [Deploy](#the-processor).
+
+> `docker compose run --rm pull` prints message bodies. It is a debugging tool
+> in the `tools` profile, not part of `up`, and it is the only thing here that
+> will show you a payload — the services themselves log an `event_id` and a
+> byte count and never the body.
+
+Without Docker: `uvicorn main:app --reload --env-file .env` for the receiver and
+`uvicorn processor_main:app --port 8081 --env-file .env` for the subscriber, but
+you will need a real topic and credentials.
 
 ## Deploy
 

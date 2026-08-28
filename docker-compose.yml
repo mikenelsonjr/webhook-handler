@@ -1,8 +1,9 @@
-# Local stack: the service plus a Pub/Sub emulator. No GCP project, no
+# Local stack: both services plus a Pub/Sub emulator. No GCP project, no
 # credentials, no billing, no risk of writing to a real topic by accident.
 #
 #   docker compose up --build
-#   curl -sS localhost:8080/healthz
+#   curl -sS localhost:8080/healthz          # ingest
+#   curl -sS localhost:8081/healthz          # processor
 #
 # Send a signed webhook (the key matches WEBHOOK_SIGNING_SECRET below):
 #   curl -sS -X POST localhost:8080/webhook \
@@ -10,7 +11,13 @@
 #     -H 'X-SigningKey: local-dev-key-not-a-real-credential' \
 #     -d '{"action":"update","data":{"_id":"abc"}}'
 #
-# Read what landed on the topic:
+# The emulator then PUSHES that message to the processor. Watch it arrive:
+#   docker compose logs processor
+#
+# The event_id in the ingest response and in the processor's log line are the
+# same value — that is the whole point of it, and this is where you can see it.
+#
+# Read the raw bytes that landed on the topic:
 #   docker compose run --rm pull
 #
 # The client talks to the emulator purely because PUBSUB_EMULATOR_HOST is set —
@@ -42,6 +49,11 @@ services:
     image: curlimages/curl:latest
     depends_on:
       pubsub: {condition: service_healthy}
+      # The PUSH subscription is created below, and the emulator starts
+      # delivering to it immediately. Waiting for the processor to be healthy
+      # first means the first message is not thrown at a dead endpoint and
+      # answered with a backoff.
+      processor: {condition: service_healthy}
     entrypoint: ["sh", "-c"]
     # A LIST with one item, not a plain string: compose word-splits a string
     # command into separate argv entries, so `sh -c` would receive only the
@@ -61,8 +73,18 @@ services:
           esac
         }
         put "$$BASE/topics/webhook-events"
+        # A PULL subscription, kept so `docker compose run --rm pull` can still
+        # show the exact bytes on the topic. Each subscription gets its own copy
+        # of every message, so this and the push subscription below do not
+        # compete — which keeps "did ingest publish it?" and "did the processor
+        # handle it?" two separately answerable questions.
         put "$$BASE/subscriptions/local-drain"           -H 'Content-Type: application/json'           -d '{"topic":"projects/local-project/topics/webhook-events"}'
-        echo "topic and subscription ready"
+        # The PUSH subscription. The emulator POSTs each message to this
+        # endpoint, which is the same delivery mechanism Cloud Run uses — no
+        # OIDC token, which is exactly why the processor runs PUSH_AUTH_MODE=none
+        # here and must not anywhere else.
+        put "$$BASE/subscriptions/processor-push"           -H 'Content-Type: application/json'           -d '{"topic":"projects/local-project/topics/webhook-events","pushConfig":{"pushEndpoint":"http://processor:8080/_pubsub/push"}}'
+        echo "topic and subscriptions ready"
   ingest:
     build: .
     depends_on:
@@ -83,6 +105,28 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  # The subscriber. Same image as ingest — one build, two entrypoints — with
+  # the command overridden. It depends on nothing: it only serves HTTP, and
+  # topic-init waits for IT rather than the other way round.
+  processor:
+    build: .
+    command: uvicorn processor_main:app --host 0.0.0.0 --port 8080
+    ports: ["8081:8080"]
+    environment:
+      # `none` means NOTHING authenticates this endpoint, and the processor
+      # warns about it at startup. Correct here — the emulator sends no OIDC
+      # token — and an alarm anywhere else. Production is `iam`, with Cloud Run
+      # validating the token before the request reaches the container.
+      PUSH_AUTH_MODE: none
+      LOG_LEVEL: INFO
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
   # On demand, not part of `up`: subscribes and prints whatever is on the topic,
   # so you can see the exact bytes and attributes the service published.
