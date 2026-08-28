@@ -24,10 +24,15 @@ variable "name_prefix" {
   description = "Prefix for every resource name, so two copies can share a project without colliding."
 
   validation {
-    # Service account ids cap at 30 characters and the longest suffix below is
-    # "-dead-letter-sub". Catching it here beats a failure deep inside a plan.
-    condition     = can(regex("^[a-z][a-z0-9-]{0,12}[a-z0-9]$", var.name_prefix))
-    error_message = "name_prefix must be lowercase letters, digits and hyphens, start with a letter, and be at most 14 characters."
+    # Service account ids cap at 30 characters, and the longest suffix applied
+    # to this prefix is "-processor" (10). So 20 is the real bound — the
+    # subscription suffixes are longer but subscription names allow 255.
+    #
+    # An earlier version of this capped at 14, derived from the wrong suffix,
+    # which made the DEFAULT VALUE fail its own validation. `terraform
+    # validate` does not catch that; only `plan` evaluates variable validation.
+    condition     = can(regex("^[a-z][a-z0-9-]{0,18}[a-z0-9]$", var.name_prefix))
+    error_message = "name_prefix must be lowercase letters, digits and hyphens, start with a letter, and be at most 20 characters (service account ids cap at 30, and the longest suffix is -processor)."
   }
 }
 

@@ -179,6 +179,21 @@ downloaded once rather than on every run. That ruleset is what catches values
 the provider schema accepts and the API later rejects — `validate` cannot see
 those, because it only checks shape.
 
+**`validate` does not evaluate variable `validation` blocks.** A default that
+violates its own constraint passes `validate` and fails on the first real
+`plan`. `plan` checks variables *before* it authenticates, so you can catch
+that with no credentials at all — ignore the ADC error and read what is above
+it:
+
+```bash
+printf 'project_id = "x-project-1234"\nregion = "us-central1"\n' > infra/check.auto.tfvars
+tf plan -input=false 2>&1 | grep "Invalid value for variable"   # want: no output
+rm infra/check.auto.tfvars
+```
+
+That is how the `name_prefix` cap was caught being one character tighter than
+its own default.
+
 Copy `infra/terraform.tfvars.example` to `terraform.tfvars` and fill it in.
 `project_id` and `region` deliberately have **no defaults**: a default there
 silently deploys to the wrong project.

@@ -24,3 +24,23 @@ output "dead_letter_topic_id" {
   value       = google_pubsub_topic.dead_letter.id
   description = "Target of the push subscription's dead_letter_policy in #22."
 }
+
+output "ingest_service_account" {
+  value       = google_service_account.ingest.email
+  description = "Runtime identity of the receiver. Publishes to the events topic; reads the signing secret."
+}
+
+output "processor_service_account" {
+  value       = google_service_account.processor.email
+  description = "Runtime identity of the processor. Grant it whatever your handler touches."
+}
+
+output "push_service_account" {
+  value       = google_service_account.push.email
+  description = "The identity Pub/Sub presents when calling the processor. Separate from both runtime identities on purpose."
+}
+
+output "pubsub_service_agent" {
+  value       = trimprefix(local.pubsub_agent, "serviceAccount:")
+  description = "Google's own Pub/Sub identity. Output because two of the grants that fail silently are made TO it, and knowing the address is half of debugging them."
+}
