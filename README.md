@@ -2,18 +2,36 @@
 
 [![CI](https://github.com/mikenelsonjr/webhook-handler/actions/workflows/ci.yml/badge.svg)](https://github.com/mikenelsonjr/webhook-handler/actions/workflows/ci.yml)
 
-A Python webhook ingest service for Cloud Run that authenticates inbound
-deliveries and publishes them to a Pub/Sub topic.
+Two Python services for Cloud Run: a **receiver** that authenticates inbound
+webhooks and publishes them to a Pub/Sub topic, and a **processor** that Pub/Sub
+pushes them back to. Both halves ship, because the interesting failures live in
+the seam between them.
 
-The pattern it implements: **accept fast, process later.** The handler does the
-minimum synchronous work — authenticate, publish, acknowledge — and returns.
-Everything expensive happens downstream in a subscriber, so a slow consumer can
-never make the sender time out.
+The pattern: **accept fast, process later.** The receiver does the minimum
+synchronous work — authenticate, publish, acknowledge — and returns. Everything
+expensive happens in the processor, so a slow consumer can never make the
+sender time out.
 
-One rule drives the design: **a 2xx is a promise.** Senders treat it as "you
-own this now." So the service acknowledges only after the publish is confirmed
-durable, and returns 503 otherwise. Returning 200 first turns every transient
-Pub/Sub error into permanent, silent data loss.
+One rule drives both sides, read from opposite ends.
+
+**A 2xx is a promise.** Senders treat it as "you own this now", so the receiver
+acknowledges only after the publish is confirmed durable, and returns 503
+otherwise. Returning 200 first turns every transient Pub/Sub error into
+permanent, silent data loss.
+
+**A 2xx means "never send me this again."** In push delivery the response
+status *is* the acknowledgement, so the processor returns 204 when an event is
+handled — and also when the envelope is unparseable, because any non-2xx is a
+nack and bad bytes never become good bytes on the third attempt.
+
+```
+provider ──▶ ingest ──▶ Pub/Sub topic ──push──▶ processor
+             (202)                              (204 ack / 503 nack)
+             └──────────── one event_id ────────────┘
+```
+
+That `event_id` is the same value in the receiver's response and the
+processor's logs. One id, grepped across two services, returns the whole story.
 
 Part of the [Accelerators](https://github.com/mikenelsonjr/Accelerators)
 catalog.
@@ -84,6 +102,30 @@ cp .env.example .env                  # then fill it in
    Aptly delivers once and ignores the response, so a 503 earns no
    redelivery. If yours retries on 5xx, the sender is a better safety net than
    in-process backoff — drop the wrapper from `main.py`.
+
+6. **`LoggingHandler` — this is the one you came for.** It is the processor's
+   default handler and it does nothing but log that an event arrived. Replace
+   it in `processor_main.py` with your own: anything with `handle(event)`
+   satisfies the protocol, and it never learns that HTTP or Pub/Sub exist.
+
+   Classify your failures. Raise `RetryableError` for something that might
+   work on the next delivery and `PermanentError` for something that never
+   will — the endpoint cannot tell them apart, and guessing is how a service
+   either loses events or redelivers a poison pill forever. **Make it
+   idempotent:** delivery is at-least-once by construction.
+
+7. **`InMemorySeenStore`, before you rely on deduplication.** It is
+   per-instance. Cloud Run runs N containers and a redelivery lands wherever
+   the load balancer sends it, so it defuses a redelivery storm on a warm
+   instance and nothing more. A real guarantee is a Firestore
+   create-if-absent with a TTL, or a Redis `SET NX EX`, behind the same two
+   methods — `claim` and `release`.
+
+8. **The ack deadline**, once you know what your handler costs. Set it above
+   the handler's *worst* case: exceed it and Pub/Sub redelivers while the
+   first attempt is still running, so one event is processed twice
+   concurrently. Work that cannot fit belongs on another topic or in Cloud
+   Tasks — the same accept-fast-process-later move, one layer down.
 
 **What not to change:** the raw request body is published byte-for-byte,
 deliberately. Re-serializing through `json.dumps` reorders keys and drops

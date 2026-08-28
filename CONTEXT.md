@@ -19,14 +19,21 @@ loss.
 
 ## Status
 
-`ingest/` is complete: rebuilt from a working Cloud Function original, 114
-tests, driven end to end against a Pub/Sub emulator. Issues 1–8 in the
-[catalog repo](https://github.com/mikenelsonjr/Accelerators/issues),
-labelled `epic:harden-ingest`, are closed.
+**Both services are built.** 320 tests, and the whole path runs on a Pub/Sub
+emulator with no GCP project and no credentials: a signed webhook to `ingest`
+is published, pushed to `processor`, and handled — with the same `event_id` in
+the ingest response and the processor's log line.
 
-`processor/` is designed but not built — the section below is the design, and
-`infra/` (Terraform for the Cloud Run services, topic, push subscription, and
-dead-letter topic) follows it.
+`ingest/` was rebuilt from a working Cloud Function original
+(`epic:harden-ingest`, issues 1–8). `processor/` was built story by story as
+`epic:build-processor`, issues 10–16, with issue 9 fixing a log formatter that
+was silently dropping every `extra=` field. All are closed in the
+[catalog repo](https://github.com/mikenelsonjr/Accelerators/issues).
+
+**`infra/` is the remaining piece** — Terraform for the Cloud Run services, the
+topic, the push subscription, and the dead-letter topic. The decisions it needs
+are already made below: the ack deadline bound, the DLQ policy, and the three
+IAM grants that fail silently.
 
 ## Decisions
 
@@ -531,9 +538,37 @@ pip install -e ".[dev]"
 python -m pytest
 ```
 
-The suite never touches GCP. `tests/ingest/conftest.py` provides a
-`FakePublisher` that records what was published and can be armed to fail —
-that is how the delivery-guarantee tests work — and its module docstring
-documents the full contract the implementation must satisfy. Read it first.
+The suite never touches GCP — no credentials, no grpc toolchain, no network.
+That is not incidental: it is why the concrete Pub/Sub client lives behind a
+`Publisher` protocol in its own `[gcp]` extra, why push-token verification is
+behind `[oidc]` and loaded lazily, and why the processor imports nothing from
+`google` at all.
 
-Run one component's suite with `pytest tests/ingest`.
+Each component's `conftest.py` opens with the contract its implementation must
+satisfy — object shapes, seam signatures, and the reasoning. **Read those
+first**; they are the shortest accurate description of the system.
+
+| Suite | What it holds |
+|---|---|
+| `pytest tests/ingest` | the receiver, driven through a `FakePublisher` that records what was published and can be armed to fail — that is how the delivery-guarantee tests work |
+| `pytest tests/processor` | the subscriber: envelope parsing, the ack table, auth, dedup, logging |
+| `pytest tests/contract` | the envelope both sides depend on |
+| `pytest tests/common` | the JSON log formatter both services share |
+
+`tests/contract/` imports **neither** component's fixtures, and a test enforces
+that. A contract test that borrows one side's fixtures has adopted one side's
+assumptions and can no longer catch that side being wrong — so it re-declares
+its own publisher double and its own rendering of the push envelope, written
+from the Pub/Sub format rather than from either implementation.
+
+Two conventions worth keeping when adding tests:
+
+- **Assert on formatter output, not on `LogRecord` attributes.** Issue 9
+  shipped a broken formatter for months because a test checked
+  `hasattr(record, "event_id")` — the call site — while the emitted line
+  contained no such field. `caplog` captures records *before* formatting, which
+  is exactly that blind spot.
+- **Parse the source, do not grep it,** when a test asserts something about the
+  code itself. `config.py`'s docstring says the words "os.environ" while
+  promising not to call it, and a line scan cannot tell the promise from the
+  breach.
