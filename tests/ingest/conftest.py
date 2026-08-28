@@ -15,8 +15,7 @@ tests have something to bind to:
             gcp_project: str
             pubsub_topic: str
             signing_secret: str
-            signature_header: str = "X-Signature-256"
-            delivery_id_header: str = "X-Delivery-Id"
+            signing_key_header: str = "X-SigningKey"
             max_body_bytes: int = 1_048_576
             source_name: str = "aptly"
 
@@ -24,8 +23,7 @@ tests have something to bind to:
             def from_env(cls, env: Mapping[str, str]) -> "Settings": ...
 
     ingest/security.py
-        def compute_signature(secret: str, body: bytes) -> str      # "sha256=<hex>"
-        def verify_signature(secret: str, body: bytes, header: str | None) -> bool
+        def verify_signing_key(expected: str, provided: str | None) -> bool
 
     ingest/publisher.py          <- must NOT import google.cloud
         class PublishError(Exception): ...
@@ -40,22 +38,26 @@ tests have something to bind to:
 
 Routes: ``GET /healthz`` (unauthenticated) and ``POST /webhook``.
 
-The concrete Pub/Sub client belongs in a separate module (e.g.
-``ingest/pubsub_publisher.py``) that only the entrypoint imports — that is why
-``google-cloud-pubsub`` is an optional ``[gcp]`` extra and the suite installs
-without it.
+WHY A SHARED SECRET AND NOT HMAC
+--------------------------------
+Aptly sends a static token in an ``x-signingkey`` header. It does not compute a
+signature over the body, so there is nothing to verify against one. This is
+weaker than HMAC — the token does not bind to the payload, it is replayable,
+and it is identical on every request — but you cannot verify a signature the
+sender never produced. Compensate with TLS, restricted ingress, and rotation.
+
+A consumer whose provider *does* sign (Stripe, GitHub, Shopify) should replace
+``verify_signing_key`` with an HMAC comparison over the raw body. The route
+calls one function, so that is a one-file change.
 
 WHY THE IMPORTS ARE INSIDE FIXTURES
 -----------------------------------
 So a missing module fails the individual tests that need it, rather than
-erroring out collection for the whole file. You can watch the suite go green
-module by module as you build.
+erroring out collection for the whole file.
 """
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import pathlib
 
@@ -63,7 +65,8 @@ import pytest
 
 from tests.conftest import REPO_ROOT, package_sources
 
-TEST_SECRET = "test-signing-secret-not-a-real-credential"  # pragma: allow-secret
+TEST_SIGNING_KEY = "test-signing-key-not-a-real-credential"  # pragma: allow-secret
+SIGNING_KEY_HEADER = "X-SigningKey"
 
 INGEST_DIR = REPO_ROOT / "ingest"
 
@@ -73,15 +76,14 @@ def ingest_sources() -> list[pathlib.Path]:
     return package_sources("ingest")
 
 
-def sign(body: bytes, secret: str = TEST_SECRET) -> str:
-    """Compute the expected signature header value.
+def auth_header(key: str = TEST_SIGNING_KEY) -> dict[str, str]:
+    """The header a legitimate Aptly delivery carries."""
+    return {SIGNING_KEY_HEADER: key}
 
-    Deliberately implemented here with stdlib rather than by calling
-    ``ingest.security.compute_signature``. A test that signs with the same
-    function it is testing passes even when that function is wrong.
-    """
-    digest = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-    return f"sha256={digest}"
+
+def json_headers(key: str = TEST_SIGNING_KEY) -> dict[str, str]:
+    """A well-formed, authenticated JSON request's headers."""
+    return {"Content-Type": "application/json", **auth_header(key)}
 
 
 def body_bytes(payload) -> bytes:
@@ -131,9 +133,8 @@ def settings():
     return Settings(
         gcp_project="test-project",
         pubsub_topic="test-topic",
-        signing_secret=TEST_SECRET,
-        signature_header="X-Signature-256",
-        delivery_id_header="X-Delivery-Id",
+        signing_secret=TEST_SIGNING_KEY,
+        signing_key_header=SIGNING_KEY_HEADER,
         max_body_bytes=1024,
         source_name="aptly",
     )
@@ -148,14 +149,17 @@ def publisher():
 def make_client(settings):
     """Build a TestClient over an app wired to a given publisher."""
     from fastapi.testclient import TestClient
+
     from ingest.app import create_app
 
     def _make(pub=None, **setting_overrides):
         import dataclasses
 
         cfg = dataclasses.replace(settings, **setting_overrides) if setting_overrides else settings
-        return TestClient(create_app(settings=cfg, publisher=pub or FakePublisher()),
-                          raise_server_exceptions=False)
+        return TestClient(
+            create_app(settings=cfg, publisher=pub or FakePublisher()),
+            raise_server_exceptions=False,
+        )
 
     return _make
 
@@ -166,16 +170,12 @@ def client(make_client, publisher):
 
 
 @pytest.fixture
-def post_signed(client):
-    """POST a JSON payload with a correct signature."""
+def post_authed(client):
+    """POST a JSON payload with a valid signing key."""
 
-    def _post(payload=None, *, raw: bytes | None = None, headers=None, secret=TEST_SECRET):
+    def _post(payload=None, *, raw: bytes | None = None, headers=None, key=TEST_SIGNING_KEY):
         data = raw if raw is not None else body_bytes(payload if payload is not None else {"a": 1})
-        hdrs = {
-            "Content-Type": "application/json",
-            "X-Signature-256": sign(data, secret),
-        }
-        hdrs.update(headers or {})
+        hdrs = {**json_headers(key), **(headers or {})}
         return client.post("/webhook", content=data, headers=hdrs)
 
     return _post

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 
-from tests.ingest.conftest import FakePublisher, body_bytes, sign
+from tests.ingest.conftest import FakePublisher, body_bytes, json_headers
 
 # A distinctive value planted in the payload so any leak is unambiguous.
 CANARY = "PII-CANARY-8fe31a9c"
@@ -17,11 +17,7 @@ CANARY = "PII-CANARY-8fe31a9c"
 
 def _post(client, payload=None):
     raw = body_bytes(payload if payload is not None else {"customer_email": CANARY})
-    return client.post(
-        "/webhook",
-        content=raw,
-        headers={"Content-Type": "application/json", "X-Signature-256": sign(raw)},
-    )
+    return client.post("/webhook", content=raw, headers=json_headers())
 
 
 def test_payload_is_never_written_to_logs(make_client, caplog):

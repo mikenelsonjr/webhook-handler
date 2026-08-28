@@ -36,12 +36,13 @@ htmlcov/
 
 # --- Not part of the runtime service -----------------------------------------
 # Tests run in CI, not in the container. Terraform provisions the service; it
-# does not ship inside it.
+# does not ship inside it. README.md and LICENSE are NOT excluded: pyproject.toml
+# references both, so the build fails without them.
 tests/
 infra/
+docker-compose.yml
 *.md
 !README.md
-LICENSE
 
 # --- Editor / OS -------------------------------------------------------------
 .idea/

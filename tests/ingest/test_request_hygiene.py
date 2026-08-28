@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from tests.ingest.conftest import FakePublisher, body_bytes, sign
+from tests.ingest.conftest import FakePublisher, auth_header, body_bytes
 
 
-def _signed_post(client, raw: bytes, content_type="application/json", **headers):
-    hdrs = {"Content-Type": content_type, "X-Signature-256": sign(raw)}
+def _authed_post(client, raw: bytes, content_type="application/json", **headers):
+    hdrs = {"Content-Type": content_type, **auth_header()}
     hdrs.update(headers)
     return client.post("/webhook", content=raw, headers=hdrs)
 
@@ -38,7 +38,7 @@ def test_oversized_body_is_413_and_publishes_nothing(make_client):
     client = make_client(pub, max_body_bytes=1024)
     raw = body_bytes({"blob": "x" * 4000})
 
-    r = _signed_post(client, raw)
+    r = _authed_post(client, raw)
 
     assert r.status_code == 413
     assert pub.call_count == 0, "an oversized body must be rejected before publishing"
@@ -50,7 +50,7 @@ def test_body_at_the_limit_is_accepted(make_client):
     raw = body_bytes({"blob": "x" * 100})
     assert len(raw) <= 2048
 
-    assert _signed_post(client, raw).status_code == 202
+    assert _authed_post(client, raw).status_code == 202
 
 
 # --- content type ------------------------------------------------------------
@@ -59,7 +59,7 @@ def test_non_json_content_type_is_415(make_client):
     pub = FakePublisher()
     client = make_client(pub)
 
-    r = _signed_post(client, b'{"a": 1}', content_type="text/plain")
+    r = _authed_post(client, b'{"a": 1}', content_type="text/plain")
 
     assert r.status_code == 415
     assert pub.call_count == 0
@@ -70,7 +70,7 @@ def test_json_content_type_with_charset_is_accepted(make_client):
     pub = FakePublisher()
     client = make_client(pub)
 
-    r = _signed_post(client, b'{"a": 1}', content_type="application/json; charset=utf-8")
+    r = _authed_post(client, b'{"a": 1}', content_type="application/json; charset=utf-8")
 
     assert r.status_code == 202
 
@@ -82,7 +82,7 @@ def test_malformed_json_is_400_and_publishes_nothing(make_client, raw):
     pub = FakePublisher()
     client = make_client(pub)
 
-    r = _signed_post(client, raw)
+    r = _authed_post(client, raw)
 
     assert r.status_code == 400
     assert pub.call_count == 0
@@ -96,7 +96,7 @@ def test_valid_but_falsy_json_is_accepted(make_client, payload):
     client = make_client(pub)
     raw = body_bytes(payload)
 
-    r = _signed_post(client, raw)
+    r = _authed_post(client, raw)
 
     assert r.status_code == 202, f"{payload!r} is valid JSON and must be accepted"
     assert pub.call_count == 1
@@ -104,8 +104,8 @@ def test_valid_but_falsy_json_is_accepted(make_client, payload):
 
 # --- CORS --------------------------------------------------------------------
 
-def test_no_cors_headers_on_success(post_signed):
-    r = post_signed({"event": "ping"})
+def test_no_cors_headers_on_success(post_authed):
+    r = post_authed({"event": "ping"})
 
     assert not [k for k in r.headers if k.lower().startswith("access-control-")]
 

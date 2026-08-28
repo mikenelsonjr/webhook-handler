@@ -1,40 +1,40 @@
+"""Authentication for inbound webhook deliveries.
+
+Aptly sends a *static token* in an ``x-signingkey`` header. It computes no
+signature over the body, so there is nothing to verify against one and
+authentication reduces to comparing that token against the configured secret.
+
+See CONTEXT.md for why this is weaker than HMAC and what compensates for it. A
+consumer whose provider does sign should replace this module's one function
+with an HMAC comparison over the raw body; the route calls nothing else.
+"""
+
+from __future__ import annotations
+
 import hmac
-import hashlib
 
 
-def compute_signature(secret: str, body: bytes) -> str:
+def verify_signing_key(expected: str, provided: str | None) -> bool:
+    """Return True only if ``provided`` is exactly the configured signing key.
+
+    Never raises. Header values are arbitrary caller-controlled input, so every
+    malformed one must produce a clean 401 — a crash here would be a
+    denial-of-service anyone could trigger by sending a odd header.
+
+    An empty ``expected`` fails closed. Without that check an unconfigured
+    service would authenticate a caller who simply sends an empty header to
+    match it, turning a missing configuration value into an open endpoint.
     """
-    Computes the HMAC SHA256 signature for the given payload using the provided secret.
+    if not expected or not provided:
+        return False
 
-    Args:
-        secret (str): The secret key used for HMAC.
-        body (bytes): The body to sign.
+    try:
+        expected_bytes = expected.encode("utf-8")
+        provided_bytes = provided.encode("utf-8")
+    except (AttributeError, UnicodeError):
+        return False
 
-    Returns:
-        str: The computed signature in hexadecimal format.
-    """
-    
-    # Create a new HMAC object using the secret and SHA256
-    hmac_obj = hmac.new(secret.encode(), body, hashlib.sha256)
-    
-    # Return the hexadecimal representation of the signature
-    return hmac_obj.hexdigest()
-
-def verify_signature(secret: str, body: bytes, signature: str) -> bool:
-    """
-    Verifies that the provided signature matches the computed signature for the given payload.
-
-    Args:
-        secret (str): The secret key used for HMAC.
-        body (bytes): The body to verify.
-        signature (str): The signature to compare against.
-
-    Returns:
-        bool: True if the signatures match, False otherwise.
-    """
-    
-    # Compute the expected signature
-    expected_signature = compute_signature(secret, body)
-    
-    # Use hmac.compare_digest for a secure comparison
-    return hmac.compare_digest(expected_signature, signature)
+    # Compared as bytes, not str: hmac.compare_digest raises TypeError on
+    # non-ASCII str input. compare_digest keeps the comparison constant-time,
+    # so response timing does not reveal how many leading characters matched.
+    return hmac.compare_digest(expected_bytes, provided_bytes)

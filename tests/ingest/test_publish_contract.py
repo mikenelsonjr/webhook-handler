@@ -9,16 +9,12 @@ from __future__ import annotations
 
 import pytest
 
-from tests.ingest.conftest import FakePublisher, body_bytes, sign
+from tests.ingest.conftest import FakePublisher, body_bytes, json_headers
 
 
 def _post(client, payload=None):
     data = body_bytes(payload if payload is not None else {"event": "ping"})
-    return client.post(
-        "/webhook",
-        content=data,
-        headers={"Content-Type": "application/json", "X-Signature-256": sign(data)},
-    )
+    return client.post("/webhook", content=data, headers=json_headers())
 
 
 def test_successful_publish_returns_202_with_the_message_id(make_client):

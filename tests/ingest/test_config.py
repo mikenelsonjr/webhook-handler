@@ -39,7 +39,7 @@ def test_defaults_are_applied():
 
     cfg = Settings.from_env(ENV)
 
-    assert cfg.signature_header == "X-Signature-256"
+    assert cfg.signing_key_header == "X-SigningKey"
     assert cfg.max_body_bytes > 0
     assert cfg.max_body_bytes <= 10 * 1024 * 1024, "must not exceed the Pub/Sub 10MB message cap"
 
@@ -47,10 +47,16 @@ def test_defaults_are_applied():
 def test_overrides_are_read_from_env():
     from ingest.config import Settings
 
-    cfg = Settings.from_env({**ENV, "MAX_BODY_BYTES": "2048", "WEBHOOK_SOURCE": "custom"})
+    cfg = Settings.from_env({
+        **ENV,
+        "MAX_BODY_BYTES": "2048",
+        "WEBHOOK_SOURCE": "custom",
+        "WEBHOOK_SIGNING_KEY_HEADER": "X-Custom-Auth",
+    })
 
     assert cfg.max_body_bytes == 2048
     assert cfg.source_name == "custom"
+    assert cfg.signing_key_header == "X-Custom-Auth"
 
 
 def test_no_hardcoded_project_or_topic_survives():

@@ -1,5 +1,6 @@
-from typing import Protocol
 from collections.abc import Mapping
+from typing import Protocol
+
 
 class Publisher(Protocol):
 

@@ -7,7 +7,7 @@ meant to be cloned into real projects and hardened, not rewritten.
 ## The pattern
 
 **Accept fast, process later.** The handler does the minimum synchronous work —
-verify the signature, publish, acknowledge — and returns. Everything expensive
+authenticate, publish, acknowledge — and returns. Everything expensive
 happens in a subscriber, so a slow consumer can never make the sender time out
 and retry.
 
@@ -47,9 +47,48 @@ in its own module that only the entrypoint touches. That is why
 `google-cloud-pubsub` is an optional `[gcp]` extra: the suite installs and runs
 without the grpc toolchain.
 
-**HMAC-SHA256 over the raw body, constant-time compare.** Every provider signs
-differently, so the header name is configurable and the scheme is documented as
-the first thing a consumer should replace. An unset secret fails closed.
+**A shared secret in a header, not HMAC — because that is what Aptly sends.**
+Aptly delivers a static token in `x-signingkey`; it computes no signature over
+the body, so there is nothing to verify against one. Verification is a
+constant-time comparison of that token. An unset secret fails closed.
+
+This is **weaker than HMAC** and the weakness is worth stating plainly: the
+token does not bind to the payload, so anyone who observes one request can
+forge any other; it is replayable; and it is identical on every request, so it
+leaks anywhere headers are logged. None of that is fixable from this side — you
+cannot verify a signature the sender never produced. Compensate with TLS-only
+transport, restricted Cloud Run ingress, and scheduled rotation.
+
+A consumer whose provider *does* sign (Stripe, GitHub, Shopify) should replace
+`verify_signing_key` with an HMAC comparison over the raw body. The route calls
+one function, so that is a one-file change — which is the point of the seam.
+
+**Bounded publish retry, because Aptly never retries.** Aptly delivers each
+event once and ignores the response, so a 503 does not earn a redelivery — a
+failed publish is a lost event, whatever status code we return. The durability
+has to live on this side of the wire.
+
+`RetryingPublisher` wraps any `Publisher` with a few attempts and exponential
+backoff: enough to absorb a transient Pub/Sub blip, and no more. It is
+deliberately not a durable spool (write failures to GCS, reconcile later),
+which is the upgrade path if losses ever show up in practice.
+
+It is a wrapper rather than logic in the route because it both satisfies and
+consumes the `Publisher` protocol, so it composes at the entrypoint:
+
+```python
+publisher = RetryingPublisher(PubSubPublisher(settings))
+```
+
+The route stays one `publisher.publish(...)` call and never learns that
+retrying happens. `attempts=1` turns it off.
+
+The tradeoff: retrying a publish that timed out *after* Pub/Sub durably stored
+the message produces a duplicate. Since the sender never retries, losing an
+event is the worse outcome, so this errs toward at-least-once — which is what
+the `event_id` attribute exists to let the processor clean up. Only
+`PublishError` is retried; anything else is a bug, and retrying a bug just
+delays the failure while burying the cause.
 
 **No CORS.** This is a server-to-server endpoint. The original returned
 `Access-Control-Allow-Origin: *` and answered OPTIONS preflights, which is
@@ -127,16 +166,17 @@ suite needs a Terraform toolchain on PATH to run at all.
 ```
 ingest/
   config.py            Settings, loaded from env, validated at startup
-  security.py          compute_signature / verify_signature
+  security.py          verify_signing_key
   publisher.py         Publisher protocol + PublishError, PublishTimeout
+  retry.py             RetryingPublisher — bounded retry, composes with any Publisher
   pubsub_publisher.py  concrete client (needs the [gcp] extra)
   app.py               create_app(settings, publisher) -> FastAPI
 ```
 
 | Route | Auth | Success | Notes |
 |---|---|---|---|
-| `GET /healthz` | none | 200 | Cloud Run probes cannot sign |
-| `POST /webhook` | HMAC | 202 | body `{message_id, event_id}` |
+| `GET /healthz` | none | 200 | Cloud Run probes cannot authenticate |
+| `POST /webhook` | signing key | 202 | body `{message_id, event_id}` |
 
 Rejections, in the order they are checked:
 
@@ -144,7 +184,7 @@ Rejections, in the order they are checked:
 |---|---|
 | Wrong method | 405 |
 | Body over `MAX_BODY_BYTES` | 413 |
-| Missing / bad signature | 401 |
+| Missing / wrong signing key | 401 |
 | Non-JSON content type | 415 |
 | Malformed JSON | 400 |
 | Publish failed or timed out | 503 |
@@ -152,9 +192,25 @@ Rejections, in the order they are checked:
 Authentication precedes content-type and payload validation, so an
 unauthenticated caller learns nothing about the request's other faults.
 
-Every published message carries `event_id` (the sender's delivery id when
-present, otherwise a deterministic hash of the body, so a retry dedups),
-`source`, and `received_at`.
+Every published message carries exactly three attributes: `event_id`,
+`source`, and `received_at`. Attributes are **chosen, not forwarded** — an
+earlier draft published `dict(request.headers)`, which put the caller's
+`Authorization`, `Cookie`, and the signing key itself onto the topic for every
+subscriber to read.
+
+`event_id` is a SHA-256 of the raw body. Aptly sends no delivery-id header, so
+there is no better source. Two consequences worth knowing:
+
+- **Retries dedup only if Aptly replays identical bytes.** If it regenerates
+  the payload — the observed body carries `viewedAt` and `lockUntil`
+  timestamps — the hash differs and the duplicate gets through. Verify this
+  against a real retry before relying on it.
+- **Byte-identical distinct events collide.** In practice those same moving
+  timestamps make that unlikely, but it is a real failure mode: the second
+  event would be silently dropped as a duplicate.
+
+`received_at` deliberately varies per delivery. `event_id` identifies the
+event; `received_at` identifies the attempt.
 
 ## Testing
 
