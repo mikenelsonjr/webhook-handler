@@ -38,8 +38,9 @@ dev = [
 [tool.setuptools.packages.find]
 # One distribution, two deployables: the webhook receiver and the Pub/Sub
 # subscriber. They share the message envelope, which is what `tests/contract/`
-# exists to pin down. Terraform lives in `infra/` and is not a Python package.
-include = ["ingest*", "processor*"]
+# exists to pin down. `common` holds only what both must agree on — today, the
+# log formatter. Terraform lives in `infra/` and is not a Python package.
+include = ["ingest*", "processor*", "common*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
