@@ -60,6 +60,12 @@ if [ -n "$added" ]; then
   #      credential instead of containing one. Indirection is the correct pattern
   #      and flagging it punishes the fix. A bare literal with neither a dot nor
   #      an underscore is still caught.
+  #   6. assignment from a CALL — `token = _bearer_token(auth)`,
+  #      `x, _, token = header.partition(" ")`. Same reasoning as 5, and the
+  #      same reasoning as the os.environ/getenv exclusion in 2, which is just
+  #      this rule written out for two specific functions. A value that is
+  #      computed is not a value that was pasted in. The literal a call is
+  #      *given* is still scanned on its own terms by the patterns above.
   # Escape hatch: append   # pragma: allow-secret   to a line to skip it.
   echo "$added" \
     | grep -Evi 'pragma:[[:space:]]*allow-secret' \
@@ -69,6 +75,7 @@ if [ -n "$added" ]; then
     | grep -Evi '(--set-secrets|secretkeyref|value_?from|secrets\.[a-z_]|\$\{\{|:latest([[:space:]]|$)|:[0-9]+$)' \
     | grep -Evi '_key[[:space:]]*[:=][[:space:]]*"[a-z_]+"' \
     | grep -Evi '[:=][[:space:]]*(([a-z_][a-z0-9_]*\.)+[a-z_][a-z0-9_]*|[a-z][a-z0-9]*(_[a-z0-9]+)+)[[:space:]]*[,)]?[[:space:]]*$' \
+    | grep -Evi '[:=][[:space:]]*[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)*\(' \
     | grep -q . && note "hardcoded credential assignment"
 fi
 

@@ -19,14 +19,29 @@ loss.
 
 ## Status
 
-`ingest/` is complete: rebuilt from a working Cloud Function original, 114
-tests, driven end to end against a Pub/Sub emulator. Issues 1–8 in the
-[catalog repo](https://github.com/mikenelsonjr/Accelerators/issues),
-labelled `epic:harden-ingest`, are closed.
+**Both services are built.** 320 tests, and the whole path runs on a Pub/Sub
+emulator with no GCP project and no credentials: a signed webhook to `ingest`
+is published, pushed to `processor`, and handled — with the same `event_id` in
+the ingest response and the processor's log line.
 
-`processor/` is designed but not built — the section below is the design, and
-`infra/` (Terraform for the Cloud Run services, topic, push subscription, and
-dead-letter topic) follows it.
+`ingest/` was rebuilt from a working Cloud Function original
+(`epic:harden-ingest`, issues 1–8). `processor/` was built story by story as
+`epic:build-processor`, issues 10–16, with issue 9 fixing a log formatter that
+was silently dropping every `extra=` field. All are closed in the
+[catalog repo](https://github.com/mikenelsonjr/Accelerators/issues).
+
+`infra/` provisions all of it in Terraform (`epic:build-infra`, issues 17–22):
+both services, both topics, three service accounts, every IAM grant, and the
+push subscription.
+
+**This is a template, and it is complete as one.** Nothing here has been
+applied to a GCP project, and that is the design rather than an omission — the
+consumer applies it to theirs. So the Terraform is verified to the level that
+is meaningful without a project: `terraform fmt`, `validate`, `tflint` with the
+Google ruleset, and variable validation exercised through `plan` (which checks
+variables before it authenticates). What that cannot catch is IAM that is
+valid-but-wrong, which is exactly why the three grants that fail silently are
+called out in comments, in the README's triage table, and here.
 
 ## Decisions
 
@@ -304,25 +319,53 @@ grant that account `roles/run.invoker`, and **Cloud Run validates the token
 before the request reaches the container** — the application then needs no
 verification code at all, and the endpoint is unreachable from the internet.
 
-That is the intended production posture. But it is not the only one — the local
-emulator sends no token, and a consumer running this outside Cloud Run has
-nothing validating anything — so verification stays a seam, `PUSH_AUTH_MODE`,
-with **no default**:
+That is the intended production posture, and in-process verification there
+would be a step backwards: it re-does work the platform already did, adds a
+dependency to the image, and puts a public-key fetch on the hot path — a new
+failure mode buying nothing.
+
+But it is not the only posture — the local emulator sends no token, and a
+consumer running this outside Cloud Run has nothing validating anything — so
+verification stays a seam, `PUSH_AUTH_MODE`, with **no default**:
 
 | Mode | Meaning | Where |
 |---|---|---|
-| `oidc` | Verify the bearer token in-process: signature, audience, and the `email` claim against `PUSH_SERVICE_ACCOUNT`. | Non-Cloud-Run hosting, or defence in depth |
-| `trusted` | Something in front of this service already authenticated the caller — or nothing has. | Cloud Run + IAM (real), local emulator (nothing) |
+| `iam` | The platform authenticated the caller before the request arrived; this service trusts it. | Cloud Run + `--no-allow-unauthenticated` — **the production default** |
+| `none` | **Nothing** authenticates this endpoint. | The emulator, local development |
+| `oidc` | Verify the bearer token in-process: signature, `aud`, and the `email` claim against `PUSH_SERVICE_ACCOUNT`. | Non-Cloud-Run hosting, or defence in depth |
 
-Naming the second mode `trusted` rather than `platform` is deliberate: it means
-"this service is trusting its network", which is true on Cloud Run and equally
-true on a laptop, and it should read uncomfortably enough that nobody sets it by
-accident. Requiring the variable follows ingest's rule that **configuration
-failures crash the container at startup** — there is no safe default here, so
-there is no default.
+`iam` and `none` do the same nothing in-process, and are still separate values
+on purpose. A config value is documentation the operator writes, so grepping
+`PUSH_AUTH_MODE` across environments has to distinguish "Cloud Run enforced
+this" from "nothing enforces this" — `none` in a production deploy is an alarm,
+and a single merged value would hide it behind the reading that is fine. `none`
+logs a WARNING at startup for the same reason.
 
-`oidc` mode is one function, `verify_push_token`, called from one place, mirroring
-`verify_signing_key` on the ingest side.
+An earlier draft merged the two under the name `trusted`, chosen so it would
+read uncomfortably. That was backwards: the mode it stigmatises is the correct
+production setting, so the name argued for `oidc` where `oidc` buys nothing.
+
+Requiring the variable follows ingest's rule that **configuration failures
+crash the container at startup** — there is no safe default here, so there is
+no default, and a typo cannot silently ship an open endpoint.
+
+`oidc` mode is one function, `verify_push_token`, called from one place,
+mirroring `verify_signing_key` on the ingest side.
+
+### The grants that fail silently
+
+Three of them, in the standard setup — a push service account distinct from the
+service's own runtime identity. None of these produce an error anywhere
+obvious; delivery simply stops, or the dead-letter topic stays empty while the
+retry count climbs:
+
+| Grant | On | Without it |
+|---|---|---|
+| `roles/run.invoker` → push SA | the Cloud Run service | 403 on every push, redelivered until retention expires |
+| `roles/iam.serviceAccountTokenCreator` → the Pub/Sub service agent, `service-<PROJECT_NUMBER>@gcp-sa-pubsub.iam.gserviceaccount.com` | the **push SA** | Pub/Sub cannot mint the token; the subscription never delivers |
+| `roles/pubsub.publisher` → that same service agent | the **dead-letter topic** | dead-lettering never happens; poison messages retry forever |
+
+The runtime identity stays separate and needs only what the handler touches.
 
 ## Idempotency is the processor's problem
 
@@ -473,7 +516,7 @@ day one and so the swap point is a single named thing rather than a TODO.
 
 | Variable | Required | Default | Notes |
 |---|---|---|---|
-| `PUSH_AUTH_MODE` | yes | — | `oidc` or `trusted`; no default, by design |
+| `PUSH_AUTH_MODE` | yes | — | `iam`, `none`, or `oidc`; no default, by design |
 | `PUSH_SERVICE_ACCOUNT` | if `oidc` | — | expected `email` claim |
 | `PUSH_AUDIENCE` | if `oidc` | — | expected `aud` claim |
 | `DEDUP_TTL_SECONDS` | no | 3600 | in-memory store only |
@@ -485,8 +528,9 @@ day one and so the swap point is a single named thing rather than a TODO.
 `docker-compose.yml` gains a `processor` service, and `topic-init` creates a
 **push** subscription aimed at `http://processor:8080/_pubsub/push` — the
 emulator supports push, so the full path runs locally with no GCP at all. The
-emulator sends no OIDC token, which is exactly why `PUSH_AUTH_MODE=trusted`
-exists and why it is spelled that way.
+emulator sends no OIDC token, which is exactly why `PUSH_AUTH_MODE=none`
+exists — and why it is a distinct value from `iam` rather than sharing one with
+the production setting.
 
 The existing `local-drain` pull subscription stays. Each subscription gets its
 own copy of every message, so `docker compose run --rm pull` still shows what
@@ -502,9 +546,37 @@ pip install -e ".[dev]"
 python -m pytest
 ```
 
-The suite never touches GCP. `tests/ingest/conftest.py` provides a
-`FakePublisher` that records what was published and can be armed to fail —
-that is how the delivery-guarantee tests work — and its module docstring
-documents the full contract the implementation must satisfy. Read it first.
+The suite never touches GCP — no credentials, no grpc toolchain, no network.
+That is not incidental: it is why the concrete Pub/Sub client lives behind a
+`Publisher` protocol in its own `[gcp]` extra, why push-token verification is
+behind `[oidc]` and loaded lazily, and why the processor imports nothing from
+`google` at all.
 
-Run one component's suite with `pytest tests/ingest`.
+Each component's `conftest.py` opens with the contract its implementation must
+satisfy — object shapes, seam signatures, and the reasoning. **Read those
+first**; they are the shortest accurate description of the system.
+
+| Suite | What it holds |
+|---|---|
+| `pytest tests/ingest` | the receiver, driven through a `FakePublisher` that records what was published and can be armed to fail — that is how the delivery-guarantee tests work |
+| `pytest tests/processor` | the subscriber: envelope parsing, the ack table, auth, dedup, logging |
+| `pytest tests/contract` | the envelope both sides depend on |
+| `pytest tests/common` | the JSON log formatter both services share |
+
+`tests/contract/` imports **neither** component's fixtures, and a test enforces
+that. A contract test that borrows one side's fixtures has adopted one side's
+assumptions and can no longer catch that side being wrong — so it re-declares
+its own publisher double and its own rendering of the push envelope, written
+from the Pub/Sub format rather than from either implementation.
+
+Two conventions worth keeping when adding tests:
+
+- **Assert on formatter output, not on `LogRecord` attributes.** Issue 9
+  shipped a broken formatter for months because a test checked
+  `hasattr(record, "event_id")` — the call site — while the emitted line
+  contained no such field. `caplog` captures records *before* formatting, which
+  is exactly that blind spot.
+- **Parse the source, do not grep it,** when a test asserts something about the
+  code itself. `config.py`'s docstring says the words "os.environ" while
+  promising not to call it, and a line scan cannot tell the promise from the
+  breach.

@@ -30,8 +30,30 @@ Build these and the tests have something to bind to::
             def handle(self, event: Event) -> None: ...
         class LoggingHandler: ...              # the runnable default stub
 
+    processor/config.py
+        @dataclass(frozen=True)
+        class Settings:
+            push_auth_mode: str            # "iam" | "none" | "oidc", no default
+            push_service_account: str | None = None   # required when oidc
+            push_audience: str | None = None          # required when oidc
+
+            @classmethod
+            def from_env(cls, env: Mapping[str, str]) -> "Settings": ...
+
+    processor/security.py
+        def verify_push_token(
+            authorization: str | None, *, audience: str, service_account: str,
+            decode=..., now=time.time,
+        ) -> bool
+
+    processor/dedup.py
+        class SeenStore(Protocol):
+            def claim(self, event_id: str) -> bool: ...   # False if already claimed
+            def release(self, event_id: str) -> None: ...
+        class InMemorySeenStore: ...   # bounded, TTL, per-instance only
+
     processor/app.py
-        def create_app(settings, handler, seen=None) -> FastAPI
+        def create_app(settings, handler, seen, *, verify=...) -> FastAPI
 
 Routes: ``GET /healthz`` (unauthenticated) and ``POST /_pubsub/push``.
 
@@ -190,7 +212,10 @@ class FakeHandler:
 def settings():
     from processor.config import Settings
 
-    return Settings()
+    # `none`: these tests are about the endpoint's delivery behaviour, not its
+    # authentication, and `none` is the mode that performs no verification.
+    # tests/processor/test_auth.py builds its own settings per mode.
+    return Settings.from_env({"PUSH_AUTH_MODE": "none"})
 
 
 @pytest.fixture
@@ -199,8 +224,20 @@ def handler():
 
 
 @pytest.fixture
-def make_client(settings):
-    """Build a TestClient over an app wired to a given handler."""
+def seen():
+    """A fresh idempotency store per test, so no claim leaks between them."""
+    from processor.dedup import InMemorySeenStore
+
+    return InMemorySeenStore()
+
+
+@pytest.fixture
+def make_client(settings, seen):
+    """Build a TestClient over an app wired to a given handler.
+
+    The same `seen` store the fixture hands the test, so a test can inspect
+    what the endpoint claimed and released.
+    """
     from fastapi.testclient import TestClient
 
     from processor.app import create_app
@@ -210,7 +247,7 @@ def make_client(settings):
 
         cfg = dataclasses.replace(settings, **setting_overrides) if setting_overrides else settings
         return TestClient(
-            create_app(settings=cfg, handler=hand or FakeHandler()),
+            create_app(settings=cfg, handler=hand or FakeHandler(), seen=seen),
             # So an unhandled exception surfaces as the response the endpoint
             # would really return, rather than being re-raised into the test.
             raise_server_exceptions=False,
